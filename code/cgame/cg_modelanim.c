@@ -1474,7 +1474,15 @@ static void CG_CoopQDrawParkInView(refEntity_t *ent, int iEntNum)
 
     if (!pOfs) {
         pOfs     = cgi.Cvar_Get("coop_qdrawHoldOfs",     "16 10 -7",  0);
-        pAng     = cgi.Cvar_Get("coop_qdrawHoldAng",     "-37 55 17",  0);
+        // [user 2026-09-08, bug-2542] "gun is facing almost straight upwards". PITCH -37 -> 14.
+        // AnglesToAxis puts axis[0][2] = -sin(pitch) (q_math.c:775-777), so a pitch of -37 aims the
+        // BARREL 37 degrees UP. Screen-flat for this pose offset is pitch +14.09 - the grip is parked
+        // forward and left of the eye, so a barrel angled slightly down projects as horizontal - which
+        // makes the shipped value 51 degrees past flat and 65 degrees from horizontal on screen.
+        // coop_qdrawHoldFlip cannot be the cause: flip 2 negates only rows 1 and 2 of the pose basis
+        // (below), so it provably cannot alter barrel elevation.
+        // This is a LIVE cvar, so it is dialable without a rebuild: coop_qdrawHoldAng "<pitch> 55 17".
+        pAng     = cgi.Cvar_Get("coop_qdrawHoldAng",     "14 55 17",  0);
         pFromOfs = cgi.Cvar_Get("coop_qdrawHoldFromOfs", "14 2 -13",  0);
         pFromAng = cgi.Cvar_Get("coop_qdrawHoldFromAng", "18 3 0",  0);
         pMs      = cgi.Cvar_Get("coop_qdrawHoldMs",      "320",       0);
@@ -1488,7 +1496,9 @@ static void CG_CoopQDrawParkInView(refEntity_t *ent, int iEntNum)
         VectorSet(vOfs, 16.0f, 10.0f, -7.0f);
     }
     if (sscanf(pAng->string, "%f %f %f", &vAng[0], &vAng[1], &vAng[2]) != 3) {
-        VectorSet(vAng, -37.0f, 55.0f, 17.0f);
+        // [bug-2542] must match the Cvar_Get default above, or a malformed cvar silently restores the
+        // 37-degrees-muzzle-up pose this fix exists to end.
+        VectorSet(vAng, 14.0f, 55.0f, 17.0f);
     }
     if (sscanf(pFromOfs->string, "%f %f %f", &vFromOfs[0], &vFromOfs[1], &vFromOfs[2]) != 3) {
         VectorSet(vFromOfs, 14.0f, 2.0f, -13.0f);
