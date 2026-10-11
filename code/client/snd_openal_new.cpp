@@ -2512,7 +2512,15 @@ static int S_OPENAL_Start2DLoopSound(
 
     iSoundOffset = (int)(pLoopSound->pSfx->info.width * pLoopSound->pSfx->info.rate
                          * (float)(cls.realtime - pLoopSound->iStartTime) / 1000.0);
-    pChannel->set_sample_offset(iSoundOffset % pLoopSound->pSfx->length);
+    // HZM coop [bug-3473, tester crash dump 2026-10-10: exception 0xC0000094 (integer divide by zero) at
+    // openmohaa.exe+0xCED54 = this function +0x2d4, on the first frame after joining m2l2b] a loop sound whose
+    // sfx has length 0 (file empty / not readable at that moment) took the whole client down on the modulo below.
+    // S_OPENAL_Start3DLoopSound has refused such an sfx all along; the 2D path never checked. Start it from 0.
+    if (pLoopSound->pSfx->length > 0) {
+        pChannel->set_sample_offset(iSoundOffset % pLoopSound->pSfx->length);
+    } else {
+        pChannel->set_sample_offset(0);
+    }
     pChannel->set_sample_loop_count(0);
     pChannel->iFlags |= CHANNEL_FLAG_LOOPING;  // HZM coop - mark 2D ambient loops so the category
                                                // mixer in set_gain treats them as ambience, not SFX
