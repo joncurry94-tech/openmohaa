@@ -4634,6 +4634,10 @@ image_t    *R_CreateImageMS(const char *name, int width, int height, int interna
 // HOME bypass off, and both resolve programs and targets present. Otherwise every call site keeps its blit / today.
 typedef void (APIENTRY *hzmDrawBuffers_t)(GLsizei n, const GLenum *bufs);
 typedef void (APIENTRY *hzmBindFragDataLocation_t)(GLuint program, GLuint color, const GLchar *name);
+// HZM gl2 [bug-3483] tess stream: GL 3.2 glDrawElementsBaseVertex. NULL = the stream stays off (old path).
+typedef void (APIENTRY *hzmDrawElementsBaseVertex_t)(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex);
+extern hzmDrawElementsBaseVertex_t qglDrawElementsBaseVertex;
+qboolean R_TessStreamDraw(int numIndexes, int firstIndex);
 extern hzmDrawBuffers_t          qglDrawBuffers;            // GL 2.0; NULL = no MRT colour resolve (blit fallback)
 extern hzmBindFragDataLocation_t qglBindFragDataLocation;   // GL 3.0; NULL = no MRT colour resolve (blit fallback)
 qboolean    R_MsaaResolvesActive(void);

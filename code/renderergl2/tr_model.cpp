@@ -353,8 +353,11 @@ dtiki_t *R_Model_GetHandle(qhandle_t handle)
 /*
 ** R_FreeModel
 */
+extern "C" void R_SkelCacheFlush(void);
+
 void R_FreeModel(model_t *mod)
 {
+    R_SkelCacheFlush();     // HZM gl2 [bug-3483] the skin cache is keyed by surface pointers
     if (mod->type == MOD_TIKI) {
         ri.CG_EndTiki(mod->d.tiki);
     }
@@ -1291,7 +1294,9 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
     if (added) {
         // found morphs
         skeletorMorphCacheIndex += added;
-        ent->e.hasMorph = qtrue;
+        // HZM gl2 [bug-3483] the COUNT, not just "yes": every reader tests it for non-zero, and the skin cache
+        // needs to know how many morph weights belong to this entity to hash them
+        ent->e.hasMorph = (qboolean)added;
     }
 
     //
@@ -1531,8 +1536,165 @@ inline static void SkelWeightMorphGetXyz(skelWeight_t *weight, skelBoneCache_t *
 RB_SkelMesh
 =============
 */
+/*
+=============
+HZM gl2 [bug-3483] THE SKIN CACHE
+
+Skeletal models are skinned on the CPU, every surface, every view, every frame: RB_SkelMesh + R_VaoPackNormal were
+28 % of the main thread on Omaha (m3l1a), where 128 of the 226 soldiers on the sand are dead and will never move
+again. The skinned result of a surface is a pure function of (surface, LOD vertex count, scale, bone matrices) - it
+is in MODEL space, the entity's position does not enter into it - so when the bones are bit-for-bit what they were
+the last times this surface was drawn, the stored vertices are copied instead.
+
+  * The key is (entity number, surface, vertex count). The entity number only spreads entries out; a wrong
+    sharing is impossible because a hit also needs the same 64-bit hash over every bone the entity has.
+  * offset[3] of a bone is never written by R_AddSkelSurfaces and is skipped by the hash.
+  * Morph weights (faces) are part of the hash: e.hasMorph carries how many the entity has. A soldier whose
+    face is moving simply never repeats; a dead one does.
+  * A surface is stored on the THIRD consecutive identical sighting, so a moving soldier costs one hash and
+    nothing else. Its buffer is kept when the pose changes and reused, not freed.
+  * malloc/free, not the engine zone: nothing here can dangle across a vid_restart. Flushed when a model is freed.
+
+r_hzmSkelCache 0 = off (live), 2 = print hit/miss/store counts every ~2 s.
+=============
+*/
+#define SKC_SLOTS        8192
+#define SKC_PROBES       4
+#define SKC_MAX_BYTES    (96 * 1024 * 1024)
+#define SKC_VERT_BYTES   (sizeof(vec4_t) + 4 * sizeof(int16_t) + sizeof(vec2_t))
+
+typedef struct {
+    skelSurfaceGame_t *sf;
+    int                entityNumber;
+    int                renderCount;
+    float              scale;
+    uint64_t           boneHash;
+    int                lastFrame;
+    int                same;        // consecutive sightings with this hash
+    qboolean           valid;       // data holds the skin for boneHash
+    int                bytes;
+    byte              *data;        // xyz[rc] | normal[rc] | texCoords[rc]
+} skcEntry_t;
+
+static skcEntry_t s_skc[SKC_SLOTS];
+static int        s_skcBytes;
+static int        s_skcHit, s_skcMiss, s_skcStore, s_skcStatFrame;
+static cvar_t    *r_hzmSkelCache;
+
+extern "C" void R_SkelCacheFlush(void)
+{
+    int i;
+
+    for (i = 0; i < SKC_SLOTS; i++) {
+        if (s_skc[i].data) {
+            free(s_skc[i].data);
+        }
+    }
+    memset(s_skc, 0, sizeof(s_skc));
+    s_skcBytes = 0;
+}
+
+static uint64_t SKC_HashBones(const skelBoneCache_t *bones, int numBones)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t)numBones;
+    int      i, k;
+
+    for (i = 0; i < numBones; i++) {
+        uint64_t w[8];
+        // offset[0..2] (offset[3] is never written), then the 3x4 matrix
+        w[0] = 0;
+        w[1] = 0;
+        memcpy(&w[0], &bones[i].offset[0], 8);
+        memcpy(&w[1], &bones[i].offset[2], 4);
+        memcpy(&w[2], &bones[i].matrix[0][0], 48);
+        for (k = 0; k < 8; k++) {
+            h ^= w[k];
+            h *= 0x100000001B3ULL;
+            h ^= h >> 29;
+        }
+    }
+    return h;
+}
+
+static skcEntry_t *SKC_Lookup(int entityNumber, skelSurfaceGame_t *sf, int rc, float scale, uint64_t h)
+{
+    unsigned int idx = ((unsigned int)entityNumber * 2654435761u) ^ ((unsigned int)((uintptr_t)sf >> 4) * 40503u)
+                       ^ ((unsigned int)rc * 97u);
+    skcEntry_t  *victim = NULL;
+    int          p;
+
+    for (p = 0; p < SKC_PROBES; p++) {
+        skcEntry_t *e = &s_skc[(idx + p) & (SKC_SLOTS - 1)];
+
+        if (e->sf == sf && e->entityNumber == entityNumber && e->renderCount == rc) {
+            e->lastFrame = tr.frameCount;
+            if (e->boneHash == h && e->scale == scale) {
+                e->same++;
+            } else {
+                e->boneHash = h;
+                e->scale    = scale;
+                e->same     = 0;
+                e->valid    = qfalse;
+            }
+            return e;
+        }
+        if (!victim || e->lastFrame < victim->lastFrame) {
+            victim = e;
+        }
+    }
+
+    if (victim->data) {
+        free(victim->data);
+        s_skcBytes -= victim->bytes;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->sf           = sf;
+    victim->entityNumber = entityNumber;
+    victim->renderCount  = rc;
+    victim->scale        = scale;
+    victim->boneHash     = h;
+    victim->lastFrame    = tr.frameCount;
+    return victim;
+}
+
+static void SKC_Store(skcEntry_t *e, int baseVertex, int rc)
+{
+    int bytes = rc * (int)SKC_VERT_BYTES;
+
+    if (!e->data) {
+        if (s_skcBytes + bytes > SKC_MAX_BYTES) {
+            // full: let go of everything that has not been drawn for ~10 s, then try once more
+            int i;
+            for (i = 0; i < SKC_SLOTS; i++) {
+                if (s_skc[i].data && tr.frameCount - s_skc[i].lastFrame > 600) {
+                    free(s_skc[i].data);
+                    s_skcBytes -= s_skc[i].bytes;
+                    s_skc[i].data  = NULL;
+                    s_skc[i].bytes = 0;
+                    s_skc[i].valid = qfalse;
+                }
+            }
+            if (s_skcBytes + bytes > SKC_MAX_BYTES) {
+                return;
+            }
+        }
+        e->data = (byte *)malloc(bytes);
+        if (!e->data) {
+            return;
+        }
+        e->bytes = bytes;
+        s_skcBytes += bytes;
+    }
+    memcpy(e->data, tess.xyz[baseVertex], rc * sizeof(vec4_t));
+    memcpy(e->data + rc * sizeof(vec4_t), tess.normal[baseVertex], rc * 4 * sizeof(int16_t));
+    memcpy(e->data + rc * (sizeof(vec4_t) + 4 * sizeof(int16_t)), tess.texCoords[baseVertex], rc * sizeof(vec2_t));
+    e->valid = qtrue;
+    s_skcStore++;
+}
+
 void RB_SkelMesh(skelSurfaceGame_t *sf)
 {
+    skcEntry_t        *skc = NULL;
     unsigned int       baseIndex, baseVertex;
     unsigned int       render_count;
     unsigned int       indexes;
@@ -1730,6 +1892,34 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
     //
     bones  = &TIKI_Skel_Bones[backEnd.currentEntity->e.bonestart];
     morphs = &skeletorMorphCache[backEnd.currentEntity->e.morphstart];
+
+    // HZM gl2 [bug-3483] the skin cache (see THE SKIN CACHE above)
+    if (!r_hzmSkelCache) {
+        r_hzmSkelCache = ri.Cvar_Get("r_hzmSkelCache", "1", 0);
+    }
+    if (r_hzmSkelCache->integer && render_count >= 24) {
+        uint64_t skcHash = SKC_HashBones(bones, ri.TIKI_GetNumChannels(tiki));
+        int      skcMorphs = (int)backEnd.currentEntity->e.hasMorph;
+
+        if (skcMorphs > 0) {
+            int mi;
+            for (mi = 0; mi < skcMorphs; mi++) {
+                skcHash ^= (uint64_t)(unsigned int)morphs[mi] + 0x9E3779B97F4A7C15ULL + (skcHash << 6) + (skcHash >> 2);
+            }
+            skcHash ^= (uint64_t)skcMorphs << 48;
+        }
+        skc = SKC_Lookup(backEnd.currentEntity->e.entityNumber, sf, (int)render_count, scale, skcHash);
+        if (skc->valid) {
+            memcpy(outXyz, skc->data, render_count * sizeof(vec4_t));
+            memcpy(outNormal, skc->data + render_count * sizeof(vec4_t), render_count * 4 * sizeof(int16_t));
+            memcpy(tess.texCoords[baseVertex], skc->data + render_count * (sizeof(vec4_t) + 4 * sizeof(int16_t)),
+                   render_count * sizeof(vec2_t));
+            s_skcHit++;
+            skc = NULL;
+            goto skc_skinned;
+        }
+        s_skcMiss++;
+    }
 
     if (backEnd.currentEntity->e.hasMorph) {
         if (mesh > 0) {
@@ -1933,6 +2123,18 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
                 outNormal += 4;
             }
         }
+    }
+
+    // HZM gl2 [bug-3483] third identical sighting in a row: keep what was just skinned
+    if (skc && skc->same >= 2) {
+        SKC_Store(skc, (int)baseVertex, (int)render_count);
+    }
+skc_skinned:
+    if (r_hzmSkelCache->integer == 2 && tr.frameCount - s_skcStatFrame > 120) {
+        ri.Printf(PRINT_ALL, "^~^~^ SKELCACHE hit=%d miss=%d store=%d over %d frames, %d KB held\n", s_skcHit, s_skcMiss,
+                  s_skcStore, tr.frameCount - s_skcStatFrame, s_skcBytes / 1024);
+        s_skcHit = s_skcMiss = s_skcStore = 0;
+        s_skcStatFrame = tr.frameCount;
     }
 
 #if 0

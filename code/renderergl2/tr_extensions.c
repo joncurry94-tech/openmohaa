@@ -210,6 +210,8 @@ void GLimp_InitExtraExtensions(void)
 	// HZM gl2 MSAA (plan P2b): the MRT colour resolve needs glDrawBuffers (GL 2.0) and glBindFragDataLocation (GL 3.0).
 	// Neither is in the qgl table; NULL means the new path keeps its blit resolves.
 	qglDrawBuffers = (hzmDrawBuffers_t)SDL_GL_GetProcAddress("glDrawBuffers");
+	// HZM gl2 [bug-3483] tess stream (tr_vbo.c): not in the qgl table either; NULL keeps the per-batch orphan path.
+	qglDrawElementsBaseVertex = (hzmDrawElementsBaseVertex_t)SDL_GL_GetProcAddress("glDrawElementsBaseVertex");
 	qglBindFragDataLocation = q_gl_version_at_least_3_0
 		? (hzmBindFragDataLocation_t)SDL_GL_GetProcAddress("glBindFragDataLocation") : NULL;
 

@@ -412,6 +412,54 @@ void R_BindNullVao(void)
 
 /*
 ============
+HZM gl2 [bug-3483] THE TESS STREAM
+
+Profile of Omaha (m3l1a, ~230 skeletal soldiers): 29 % of the main thread inside RB_UpdateTessVao, nearly all of it in
+the GL driver. The function orphaned the whole dynamic buffer (glBufferData NULL, vertex AND index) before every
+batch, and a skeletal model is one batch per surface per view - well over a thousand buffer re-allocations a frame.
+
+The buffer is a ring now, HZM_TESS_STREAM_MUL batches long. Each batch is written behind a cursor (the layout is
+still one region per attribute, so "behind the cursor" is the same vertex index in every region) and drawn with
+glDrawElementsBaseVertex; the buffer is orphaned only when the next batch would not fit, so nothing the GPU may
+still be reading is ever overwritten. Every dynamic draw in this renderer goes through R_DrawElements, which is the
+only other place that had to change.
+
+r_hzmTessStream 0 = the old behaviour (orphan per batch, base 0), live. Without glDrawElementsBaseVertex (GL < 3.2)
+the buffer keeps its old size and the old path runs.
+============
+*/
+#define HZM_TESS_STREAM_MUL 64
+
+hzmDrawElementsBaseVertex_t qglDrawElementsBaseVertex;
+cvar_t *r_hzmTessStream;
+
+static int s_tessStreamVerts;		// vertices the tess VBO holds per attribute region
+static int s_tessStreamIndexes;
+static int s_tessCursorV, s_tessCursorI;	// next free vertex / index
+static int s_tessDrawBaseV, s_tessDrawFirstI;	// where the batch being drawn lives
+
+/*
+============
+R_TessStreamDraw
+
+qtrue = drawn. Only for the tess VAO, and only while the batch in it was written at a non-zero base.
+============
+*/
+qboolean R_TessStreamDraw(int numIndexes, int firstIndex)
+{
+	if (glState.currentVao != tess.vao || !qglDrawElementsBaseVertex) {
+		return qfalse;
+	}
+	if (!s_tessDrawBaseV && !s_tessDrawFirstI) {
+		return qfalse;
+	}
+	qglDrawElementsBaseVertex(GL_TRIANGLES, numIndexes, GL_INDEX_TYPE,
+		BUFFER_OFFSET((firstIndex + s_tessDrawFirstI) * sizeof(glIndex_t)), s_tessDrawBaseV);
+	return qtrue;
+}
+
+/*
+============
 R_InitVaos
 ============
 */
@@ -419,6 +467,16 @@ void R_InitVaos(void)
 {
 	int             vertexesSize, indexesSize;
 	int             offset;
+
+	r_hzmTessStream = ri.Cvar_Get("r_hzmTessStream", "1", 0);
+	s_tessStreamVerts = SHADER_MAX_VERTEXES;
+	s_tessStreamIndexes = SHADER_MAX_INDEXES;
+	if (qglDrawElementsBaseVertex) {
+		s_tessStreamVerts *= HZM_TESS_STREAM_MUL;
+		s_tessStreamIndexes *= HZM_TESS_STREAM_MUL;
+	}
+	s_tessCursorV = s_tessCursorI = 0;
+	s_tessDrawBaseV = s_tessDrawFirstI = 0;
 
 	ri.Printf(PRINT_ALL, "------- R_InitVaos -------\n");
 
@@ -431,9 +489,9 @@ void R_InitVaos(void)
 	vertexesSize += sizeof(tess.texCoords[0]);
 	vertexesSize += sizeof(tess.lightCoords[0]);
 	vertexesSize += sizeof(tess.lightdir[0]);
-	vertexesSize *= SHADER_MAX_VERTEXES;
+	vertexesSize *= s_tessStreamVerts;
 
-	indexesSize = sizeof(tess.indexes[0]) * SHADER_MAX_INDEXES;
+	indexesSize = sizeof(tess.indexes[0]) * s_tessStreamIndexes;
 
 	tess.vao = R_CreateVao("tessVertexArray_VAO", NULL, vertexesSize, NULL, indexesSize, VAO_USAGE_DYNAMIC);
 
@@ -471,12 +529,12 @@ void R_InitVaos(void)
 	tess.vao->attribs[ATTR_INDEX_COLOR         ].normalized = GL_TRUE;
 	tess.vao->attribs[ATTR_INDEX_LIGHTDIRECTION].normalized = GL_TRUE;
 
-	tess.vao->attribs[ATTR_INDEX_POSITION      ].offset = offset; offset += sizeof(tess.xyz[0])         * SHADER_MAX_VERTEXES;
-	tess.vao->attribs[ATTR_INDEX_NORMAL        ].offset = offset; offset += sizeof(tess.normal[0])      * SHADER_MAX_VERTEXES;
-	tess.vao->attribs[ATTR_INDEX_TANGENT       ].offset = offset; offset += sizeof(tess.tangent[0])     * SHADER_MAX_VERTEXES;
-	tess.vao->attribs[ATTR_INDEX_TEXCOORD      ].offset = offset; offset += sizeof(tess.texCoords[0])   * SHADER_MAX_VERTEXES;
-	tess.vao->attribs[ATTR_INDEX_LIGHTCOORD    ].offset = offset; offset += sizeof(tess.lightCoords[0]) * SHADER_MAX_VERTEXES;
-	tess.vao->attribs[ATTR_INDEX_COLOR         ].offset = offset; offset += sizeof(tess.color[0])       * SHADER_MAX_VERTEXES;
+	tess.vao->attribs[ATTR_INDEX_POSITION      ].offset = offset; offset += sizeof(tess.xyz[0])         * s_tessStreamVerts;
+	tess.vao->attribs[ATTR_INDEX_NORMAL        ].offset = offset; offset += sizeof(tess.normal[0])      * s_tessStreamVerts;
+	tess.vao->attribs[ATTR_INDEX_TANGENT       ].offset = offset; offset += sizeof(tess.tangent[0])     * s_tessStreamVerts;
+	tess.vao->attribs[ATTR_INDEX_TEXCOORD      ].offset = offset; offset += sizeof(tess.texCoords[0])   * s_tessStreamVerts;
+	tess.vao->attribs[ATTR_INDEX_LIGHTCOORD    ].offset = offset; offset += sizeof(tess.lightCoords[0]) * s_tessStreamVerts;
+	tess.vao->attribs[ATTR_INDEX_COLOR         ].offset = offset; offset += sizeof(tess.color[0])       * s_tessStreamVerts;
 	tess.vao->attribs[ATTR_INDEX_LIGHTDIRECTION].offset = offset;
 
 	tess.vao->attribs[ATTR_INDEX_POSITION      ].stride = sizeof(tess.xyz[0]);
@@ -602,11 +660,32 @@ void RB_UpdateTessVao(unsigned int attribBits)
 	{
 		int attribIndex;
 		int attribUpload;
+		int baseV = 0, baseI = 0;
+		qboolean stream = (qboolean)(s_tessStreamVerts > SHADER_MAX_VERTEXES && r_hzmTessStream->integer);
 
 		R_BindVao(tess.vao);
 
-		// orphan old vertex buffer so we don't stall on it
-		qglBufferData(GL_ARRAY_BUFFER, tess.vao->vertexesSize, NULL, GL_DYNAMIC_DRAW);
+		if (stream && s_tessCursorV + tess.numVertexes <= s_tessStreamVerts
+			&& s_tessCursorI + tess.numIndexes <= s_tessStreamIndexes) {
+			// HZM gl2 [bug-3483] room behind the cursor: append, no orphan
+			baseV = s_tessCursorV;
+			baseI = s_tessCursorI;
+		} else {
+			// orphan old vertex buffer so we don't stall on it
+			qglBufferData(GL_ARRAY_BUFFER, tess.vao->vertexesSize, NULL, GL_DYNAMIC_DRAW);
+			// orphan old index buffer so we don't stall on it
+			qglBufferData(GL_ELEMENT_ARRAY_BUFFER, tess.vao->indexesSize, NULL, GL_DYNAMIC_DRAW);
+		}
+		if (stream) {
+			s_tessCursorV = baseV + tess.numVertexes;
+			s_tessCursorI = baseI + tess.numIndexes;
+		} else {
+			// off: every batch starts at 0, and the ring restarts with an orphan when it is switched back on
+			s_tessCursorV = s_tessStreamVerts;
+			s_tessCursorI = s_tessStreamIndexes;
+		}
+		s_tessDrawBaseV = baseV;
+		s_tessDrawFirstI = baseI;
 
 		// if nothing to set, set everything
 		if(!(attribBits & ATTR_BITS))
@@ -622,7 +701,7 @@ void RB_UpdateTessVao(unsigned int attribBits)
 			if (attribUpload & attribBit)
 			{
 				// note: tess has a VBO where stride == size
-				qglBufferSubData(GL_ARRAY_BUFFER, vAtb->offset, tess.numVertexes * vAtb->stride, tess.attribPointers[attribIndex]);
+				qglBufferSubData(GL_ARRAY_BUFFER, vAtb->offset + baseV * vAtb->stride, tess.numVertexes * vAtb->stride, tess.attribPointers[attribIndex]);
 			}
 
 			if (attribBits & attribBit)
@@ -646,10 +725,7 @@ void RB_UpdateTessVao(unsigned int attribBits)
 			}
 		}
 
-		// orphan old index buffer so we don't stall on it
-		qglBufferData(GL_ELEMENT_ARRAY_BUFFER, tess.vao->indexesSize, NULL, GL_DYNAMIC_DRAW);
-
-		qglBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, tess.numIndexes * sizeof(tess.indexes[0]), tess.indexes);
+		qglBufferSubData(GL_ELEMENT_ARRAY_BUFFER, baseI * sizeof(tess.indexes[0]), tess.numIndexes * sizeof(tess.indexes[0]), tess.indexes);
 	}
 }
 

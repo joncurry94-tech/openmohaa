@@ -45,6 +45,10 @@ void R_DrawElements( int numIndexes, int firstIndex )
 	{
 		VaoCache_DrawElements(numIndexes, firstIndex);
 	}
+	else if (R_TessStreamDraw(numIndexes, firstIndex))
+	{
+		// HZM gl2 [bug-3483] drawn from the tess ring at its base vertex / first index (tr_vbo.c)
+	}
 	else
 	{
 		qglDrawElements(GL_TRIANGLES, numIndexes, GL_INDEX_TYPE, BUFFER_OFFSET(firstIndex * sizeof(glIndex_t)));
