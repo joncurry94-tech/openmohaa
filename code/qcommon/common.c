@@ -121,6 +121,7 @@ cvar_t	*com_legacyprotocol;
 cvar_t	*com_basegame;
 cvar_t  *com_homepath;
 cvar_t	*com_busyWait;
+cvar_t	*com_preciseFps;	// HZM coop [bug-3494] 1 = the frame limit is paced in microseconds (see Com_Frame)
 #ifndef DEDICATED
 cvar_t  *con_autochat;
 #endif
@@ -1990,6 +1991,7 @@ void Com_Init( char *commandLine ) {
 	com_maxfpsMinimized = Cvar_Get( "com_maxfpsMinimized", "0", CVAR_ARCHIVE );
 	com_abnormalExit = Cvar_Get( "com_abnormalExit", "0", CVAR_ROM );
 	com_busyWait = Cvar_Get("com_busyWait", "0", CVAR_ARCHIVE);
+	com_preciseFps = Cvar_Get( "com_preciseFps", "1", CVAR_ARCHIVE );
 
 	if( com_dedicated->integer )
 	{
@@ -2311,6 +2313,30 @@ int Com_ModifyMsec( int msec ) {
 
 /*
 =================
+Com_HzmMicros
+
+HZM coop [bug-3494] a microsecond clock for the frame limiter (QueryPerformanceCounter; split divide so a long
+uptime cannot overflow)
+=================
+*/
+static long long Com_HzmMicros( void )
+{
+#ifdef _WIN32
+	static LARGE_INTEGER freq;
+	LARGE_INTEGER        now;
+
+	if ( !freq.QuadPart ) {
+		QueryPerformanceFrequency( &freq );
+	}
+	QueryPerformanceCounter( &now );
+	return ( now.QuadPart / freq.QuadPart ) * 1000000LL + ( now.QuadPart % freq.QuadPart ) * 1000000LL / freq.QuadPart;
+#else
+	return (long long)Sys_Milliseconds() * 1000LL;
+#endif
+}
+
+/*
+=================
 Com_TimeVal
 =================
 */
@@ -2377,6 +2403,7 @@ void Com_Frame( void ) {
 	int		msec, minMsec;
 	int		timeVal, timeValSV;
 	static int	lastTime = 0, bias = 0;
+	long long	hzmIntervalUs = 0;	// HZM coop [bug-3494] > 0 = pace this frame in microseconds
  
 	int		timeBeforeFirstEvents;
 	int		timeBeforeServer;
@@ -2454,6 +2481,24 @@ void Com_Frame( void ) {
             // Adjust minMsec if previous frame took too long to render so
             // that framerate is stable at the requested value.
             minMsec -= bias;
+
+            // HZM coop [user 2026-10-11, bug-3494] "add frame limiter". The limit above is paced in WHOLE
+            // milliseconds (minMsec = 1000 / fps), so only 1000/N values exist: 142 or 166 but not 144, 166 or
+            // 200 but not 177 - a player cannot cap just under a 120 / 144 / 165 / 180 / 240 Hz display, which
+            // is what a G-Sync / FreeSync display wants. With com_preciseFps 1 (default) the same cvars are paced
+            // in microseconds against a running target, so com_maxfps means exactly what it says and an
+            // overslept frame does not shift the ones after it. 0 = the old millisecond pacing.
+            if (com_preciseFps->integer)
+            {
+                int fps = com_maxfps->integer;
+
+                if (com_minimized->integer && com_maxfpsMinimized->integer > 0)
+                    fps = com_maxfpsMinimized->integer;
+                else if (com_unfocused->integer && com_maxfpsUnfocused->integer > 0)
+                    fps = com_maxfpsUnfocused->integer;
+                if (fps > 0 && fps <= 1000)
+                    hzmIntervalUs = 1000000LL / fps;
+            }
         }
     }
     else
@@ -2462,6 +2507,40 @@ void Com_Frame( void ) {
     HzmDiag_Mark( HZP_IDLE ); // HZM coop [bug-3486] the fps-cap wait is not work...
     HzmDiag_IdleBudget( minMsec ); // ...unless it runs far past what was asked for (a stalled process)
 
+    if (hzmIntervalUs > 0)
+    {
+        // HZM coop [bug-3494] the target is the PREVIOUS target plus one interval, never "now plus one interval":
+        // that is what keeps the average exact. A frame that ran more than an interval late (or a changed limit)
+        // starts a fresh schedule instead of being chased.
+        static long long nextUs = 0;
+        long long        nowUs  = Com_HzmMicros();
+        long long        leftUs;
+
+        nextUs += hzmIntervalUs;
+        if (nextUs < nowUs - hzmIntervalUs || nextUs > nowUs + hzmIntervalUs * 2)
+            nextUs = nowUs;
+
+        for (;;)
+        {
+            timeValSV = com_sv_running->integer ? SV_SendQueuedPackets() : 1000;
+
+            leftUs = nextUs - Com_HzmMicros();
+            if (leftUs <= 0)
+                break;
+
+            // sleep while there is room for the 1 ms timer to be late, then yield-spin the last stretch
+            if (!com_busyWait->integer && leftUs > 2500 && timeValSV > 1)
+            {
+                timeVal = (int)((leftUs - 1500) / 1000);
+                if (timeVal > timeValSV - 1)
+                    timeVal = timeValSV - 1;
+                NET_Sleep(timeVal < 1 ? 1 : timeVal);
+            }
+            else
+                NET_Sleep(0);
+        }
+    }
+    else
     do
     {
         if (com_sv_running->integer)

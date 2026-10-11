@@ -473,6 +473,31 @@ cineHide = the coop cinematic HUD suppression is active.
 */
 /*
 ====================
+CG_CoopScoreHudMirror
+
+HZM coop [bug-3485] ui/hud_score.urc (the retail "Score: n (n)" line) is shown in multiplayer only. The menu file
+is shared by coop and MP, and the MP/coop isolation contract (docs/tools/check_mp_isolation.py clause 7) does not
+let a shared file name an MP cvar - so the HUD is gated on this neutral cvar, and the one place that knows which
+kind of session this is keeps it current. Written only when it changes.
+====================
+*/
+static void CG_CoopScoreHudMirror(void)
+{
+    static cvar_t *cvMp = NULL, *cvHud = NULL;
+    int            want;
+
+    if (!cvMp) {
+        cvMp  = cgi.Cvar_Get("coop_mp_session", "0", 0);
+        cvHud = cgi.Cvar_Get("cg_hudScore", "0", 0);
+    }
+    want = cvMp->integer ? 1 : 0;
+    if (cvHud->integer != want) {
+        cgi.Cvar_Set("cg_hudScore", want ? "1" : "0");
+    }
+}
+
+/*
+====================
 CG_DrawCoopPinned
 
 HZM coop [bug-3485, user 2026-10-11: "Make the enemies remaining text smaller"] The enemies-remaining readout
@@ -536,6 +561,7 @@ void CG_DrawCoopFeed(qboolean cineHide)
     fontheader_t *font;
 
     CG_CoopFeedInit();
+    CG_CoopScoreHudMirror();
     if (!cineHide) {
         CG_DrawCoopPinned();        // [bug-3485] not part of the feed: coop_feed 0 does not hide it
     }

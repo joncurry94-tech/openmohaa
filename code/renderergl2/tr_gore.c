@@ -242,6 +242,118 @@ static void R_GoreReadTexImage(image_t *img, byte *out)
 
 /*
 ================
+R_GoreBasePixels
+
+HZM coop [user 2026-10-11, bug-3493] "fix the enemy spawns on one frame". The slow frames of a firefight, profiled
+on m3l1b (frames >= 28 ms only): 52 % of their time was RE_EndFrame -> R_GoreCommitPending -> R_GoreAcquireInstance
+-> glGetTexImage. The FIRST wound on a soldier copies his whole skin texture back from the GPU, synchronously - a
+compressed 2048x2048 skin is decompressed by the driver and the pipeline is flushed - about 55 ms, on every first
+hit of every soldier, for a picture that is the same for every man wearing that uniform.
+
+So the readback is kept: a small cache of base pixels keyed by the image's NAME and size (not its pointer or GL
+id - those are recycled across maps, the name is what the pixels are a function of; a changed pak set or picmip
+goes through a renderer restart, which unloads this DLL and the cache with it). The first wound on the first man
+in a given uniform still reads back; every later one is a memcpy. Kept across maps on purpose, bounded by
+r_goreBaseCacheMB (192; 0 = off, the old behaviour) with least-recently-used eviction.
+================
+*/
+#define GORE_BASECACHE_SLOTS 32
+
+typedef struct {
+    char  name[MAX_QPATH];
+    int   w, h;
+    byte *pixels;
+    int   lastUse;
+} goreBase_t;
+
+static goreBase_t s_goreBase[GORE_BASECACHE_SLOTS];
+static size_t     s_goreBaseBytes;
+static int        s_goreBaseClock;
+static int        s_goreBaseHits, s_goreBaseReads;
+
+static void R_GoreBaseFree(goreBase_t *b)
+{
+    if (b->pixels) {
+        s_goreBaseBytes -= (size_t)b->w * b->h * 4;
+        ri.Free(b->pixels);
+    }
+    Com_Memset(b, 0, sizeof(*b));
+}
+
+static void R_GoreBasePixels(image_t *img, int w, int h, byte *out)
+{
+    static cvar_t *capMB = NULL;
+    size_t         need  = (size_t)w * h * 4, cap;
+    goreBase_t    *b, *slot = NULL;
+    int            i;
+
+    if (!capMB) {
+        capMB = ri.Cvar_Get("r_goreBaseCacheMB", "192", CVAR_ARCHIVE);
+    }
+    cap = capMB->integer > 0 ? (size_t)capMB->integer * 1024 * 1024 : 0;
+
+    if (cap) {
+        for (i = 0; i < GORE_BASECACHE_SLOTS; i++) {
+            b = &s_goreBase[i];
+            if (b->pixels && b->w == w && b->h == h && !Q_stricmp(b->name, img->imgName)) {
+                Com_Memcpy(out, b->pixels, need);
+                b->lastUse = ++s_goreBaseClock;
+                s_goreBaseHits++;
+                return;
+            }
+        }
+    }
+
+    R_GoreReadTexImage(img, out);
+    s_goreBaseReads++;
+    if (r_goreDebug && r_goreDebug->integer) {
+        ri.Printf(PRINT_ALL, "^~^~^ GORE base readback %s %dx%d (readbacks %d, cache hits %d, cache %d MB)\n", img->imgName,
+                  w, h, s_goreBaseReads, s_goreBaseHits, (int)(s_goreBaseBytes >> 20));
+    }
+    if (!cap || need > cap) {
+        return;
+    }
+
+    // make room: an empty slot, else the least recently used; then evict until the bytes fit
+    for (i = 0; i < GORE_BASECACHE_SLOTS; i++) {
+        b = &s_goreBase[i];
+        if (!b->pixels) {
+            slot = b;
+            break;
+        }
+        if (!slot || b->lastUse < slot->lastUse) {
+            slot = b;
+        }
+    }
+    R_GoreBaseFree(slot);
+    while (s_goreBaseBytes + need > cap) {
+        goreBase_t *old = NULL;
+
+        for (i = 0; i < GORE_BASECACHE_SLOTS; i++) {
+            b = &s_goreBase[i];
+            if (b->pixels && (!old || b->lastUse < old->lastUse)) {
+                old = b;
+            }
+        }
+        if (!old) {
+            break;
+        }
+        R_GoreBaseFree(old);
+    }
+    slot->pixels = ri.Malloc(need);
+    if (!slot->pixels) {
+        return;
+    }
+    Com_Memcpy(slot->pixels, out, need);
+    Q_strncpyz(slot->name, img->imgName, sizeof(slot->name));
+    slot->w       = w;
+    slot->h       = h;
+    slot->lastUse = ++s_goreBaseClock;
+    s_goreBaseBytes += need;
+}
+
+/*
+================
 R_GoreFreeInstance
 
 Frees the CPU copy and clears the slot.  The GL image slot (instImage) is
@@ -1245,7 +1357,7 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
 
     // read the uploaded base texture back (post-picmip, post-lightscale ->
     // the copy is pixel-identical to what everyone else renders)
-    R_GoreReadTexImage(baseImage, inst->pixels);
+    R_GoreBasePixels(baseImage, w, h, inst->pixels); // [bug-3493] cached per uniform texture
 
     // respecify our instance slot with the copy (gl2 RE_UploadCinematic pattern:
     // the DSA-wrapped texture entry points keep the tr_dsa binding cache coherent)
@@ -1591,7 +1703,7 @@ static void R_GoreRebaseInstance(goreInstance_t *inst)
         inst->height = h;
     }
 
-    R_GoreReadTexImage(newImg, inst->pixels);
+    R_GoreBasePixels(newImg, w, h, inst->pixels); // [bug-3493]
 
     for (i = 0; i < inst->numStamps; i++) {
         R_GoreStampPixels(inst, &inst->stamps[i], &py, &half);
@@ -1869,5 +1981,8 @@ void R_GoreShutdown(void)
     for (i = 0; i < GORE_MAX_INSTANCES; i++) {
         s_goreInstances[i].instImage    = NULL;
         s_goreInstances[i].lastUseFrame = 0;
+    }
+    for (i = 0; i < GORE_BASECACHE_SLOTS; i++) { // [bug-3493] the textures these were read from are about to go
+        R_GoreBaseFree(&s_goreBase[i]);
     }
 }

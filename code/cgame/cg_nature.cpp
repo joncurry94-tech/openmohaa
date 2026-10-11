@@ -81,6 +81,68 @@ void ClientGameCommandManager::InitializeRainCvars()
 // down and we never double up rain on maps that already author it.
 int g_lastRainEntityTime = 0;
 
+/*
+====================
+CG_RainBrushDropVisible
+
+HZM coop [tester report, bug-3466] "rain goes through roofs". Every roof test the coop rain has (the per-drop sky
+gate, the wall clamp) lives in CG_RainGlobal, the path for maps WITHOUT rain brushes. A map that ships its own
+func_rain brushes is drawn by the retail CG_Rain below, which tested nothing: a drop starts anywhere in the brush
+box - roofs, upper floors and the street are all inside it - and its streak runs to the brush bottom through
+whatever is there (57 of 368 roofed standing spots on m5l1b are inside a rain brush or its drift).
+
+Same two tests as the brushless path, per drop: straight up from the drop's start must reach sky
+(coop_rainSkyStrict 1 = must land on a SURF_SKY surface), and the streak is cut at the first solid it meets.
+coop_rainBrushRoof 0 = the retail behaviour. e3l1 / e3l2 are left exactly as shipped (the user's standing rule
+for the Omaha-family maps is that their look is not touched without asking).
+====================
+*/
+static qboolean CG_RainBrushDropVisible(const vec3_t vStart, vec3_t vEnd, int *piLife)
+{
+    static cvar_t *pOn = NULL, *pStrict = NULL;
+    vec3_t         vZero = {0.0f, 0.0f, 0.0f};
+    vec3_t         vSkyEnd;
+    trace_t        tr;
+
+    if (!pOn) {
+        pOn     = cgi.Cvar_Get("coop_rainBrushRoof", "1", CVAR_ARCHIVE);
+        pStrict = cgi.Cvar_Get("coop_rainSkyStrict", "1", CVAR_ARCHIVE);
+    }
+    if (!pOn->integer) {
+        return qtrue;
+    }
+    // not cached: a static could outlive the map it was worked out for, and this is nothing next to two traces
+    if (strstr(cgs.mapname, "e3l1") || strstr(cgs.mapname, "e3l2")) {
+        return qtrue;
+    }
+
+    // SKY GATE: straight up from the drop's own start
+    VectorCopy(vStart, vSkyEnd);
+    vSkyEnd[2] += 16384.0f;
+    cgi.CM_BoxTrace(&tr, vStart, vSkyEnd, vZero, vZero, 0, MASK_SOLID, qfalse);
+    if (pStrict->integer) {
+        if (!(tr.surfaceFlags & SURF_SKY)) {
+            return qfalse;
+        }
+    } else if (!(tr.surfaceFlags & SURF_SKY) && tr.fraction < 0.999f) {
+        return qfalse;
+    }
+
+    // WALL CLAMP: cut the streak at the first solid surface (roof, wall, ground)
+    cgi.CM_BoxTrace(&tr, vStart, vEnd, vZero, vZero, 0, MASK_SOLID, qfalse);
+    if (tr.fraction < 1.0f) {
+        if (tr.fraction < 0.1f) {
+            return qfalse;
+        }
+        VectorCopy(tr.endpos, vEnd);
+        *piLife = (int)(*piLife * tr.fraction);
+        if (*piLife < 50) {
+            return qfalse;
+        }
+    }
+    return qtrue;
+}
+
 void CG_Rain(centity_t *cent)
 {
     int         iLife;
@@ -206,6 +268,11 @@ void CG_Rain(centity_t *cent)
             // Fixed in 2.0
             //  Rain particles must not last longer than 10 seconds
             iLife = 10000;
+        }
+
+        // HZM coop [bug-3466] the brush path had no world test at all
+        if (!CG_RainBrushDropVisible(vStart, vEnd, &iLife)) {
+            continue;
         }
 
         CG_CreateBeam(
