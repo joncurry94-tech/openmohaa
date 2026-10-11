@@ -21,7 +21,8 @@ cgame gets the plain text. The text is echoed to the console WITHOUT a colour by
 and qconsole.log but never reaches the gmbox (UI_PrintConsole routes only prefixed text there).
 
 Client cvars: coop_feed 0 (no feed lines) / 1 (default) / 2 (feed + mirror into the old box, non-bold),
-coop_hints 0/1, coop_feedX / coop_feedY (placement in 640-wide HUD units from the left / bottom),
+coop_hints 0/1, coop_feedX (hi-res HUD units from the left) / coop_feedYv (640x480 VIRTUAL units from the bottom,
+the script huddraw space the item counters live in),
 coop_feedDebug 1 (one ^~^~^ FEED line per accepted message, for the harness).
 ===========================================================================
 */
@@ -84,7 +85,15 @@ void CG_CoopFeedInit(void)
     s_cvFeed  = cgi.Cvar_Get("coop_feed", "1", CVAR_ARCHIVE);
     s_cvHints = cgi.Cvar_Get("coop_hints", "1", CVAR_ARCHIVE);
     s_cvX     = cgi.Cvar_Get("coop_feedX", "22", CVAR_ARCHIVE);
-    s_cvY     = cgi.Cvar_Get("coop_feedY", "116", CVAR_ARCHIVE); // clear of the item counters above the health panel (run 4)
+    // [user 2026-10-06 / 2026-10-11, bug-3464] "your new small text for intel etc overlaps with the medkit, ammo and
+    // sandbag icons". The feed sat coop_feedY (116) HI-RES units above the bottom, but the counters it has to clear are
+    // script huddraw elements in the 640x480 VIRTUAL screen (medkit.scr: rect 5 -62 16 16, i.e. their top edge is
+    // 62 * vidHeight / 480 above the bottom). Hi-res units are 1 px up to 1920x1080 and vidHeight / 1080 above it, so
+    // the two only agreed at the 720p the harness ran: counters top 93 px vs feed 116 px there, but 139 px vs 116 px
+    // at 1080p and 186 px vs 155 px at 1440p (16:9 or ultrawide alike) - the feed sat ON the counters everywhere real.
+    // The anchor is now in the SAME virtual-480 units as the counters: 70 = 8 units above their top at every size.
+    // New cvar name on purpose: an archived coop_feedY 116 from an old config would mean something else here.
+    s_cvY     = cgi.Cvar_Get("coop_feedYv", "70", CVAR_ARCHIVE);
     s_cvDebug = cgi.Cvar_Get("coop_feedDebug", "0", 0);
     cgi.Cvar_Get("coop_hintSeen", "", CVAR_ARCHIVE);
     cgi.Cvar_Get("coop_hintSeen2", "", CVAR_ARCHIVE);
@@ -538,7 +547,8 @@ void CG_DrawCoopFeed(qboolean cineHide)
     sy     = cgs.uiHiResScale[1];
     unitsH = (float)cgs.glconfig.vidHeight / sy;
     x0     = s_cvX->value;
-    bottom = unitsH - s_cvY->value;
+    // bottom edge in feed units: coop_feedYv virtual-480 units above the bottom of the screen (see CG_CoopFeedInit)
+    bottom = ((float)cgs.glconfig.vidHeight - s_cvY->value * ((float)cgs.glconfig.vidHeight / 480.0f)) / sy;
 
     // newest at the bottom: walk newest -> oldest, stacking upward
     target = 0.0f;
