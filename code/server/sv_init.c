@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "../qcommon/hzm_diag.h" // HZM coop [bug-3486]
 #include "../qcommon/net_rendezvous.h" // HZM coop [238]
 #include "../client/client.h"
 #include "../qcommon/tiki.h"
@@ -626,6 +627,11 @@ void SV_SpawnServer( const char *server, qboolean loadgame, qboolean restart, qb
 	iStart = Sys_Milliseconds();
 	Com_Printf ("Server: %s\n",server);
 
+	// HZM coop [bug-3486] a map load is a legitimately long frame: the hitch log names it, the freeze watchdog waits longer
+	HzmDiag_LongOp( HZF_MAPLOAD_SV, 1, "server map load" );
+	HzmDiag_SetMap( server );
+	HzmDiag_Event( "host: map change -> %s%s", server, restart ? " (restart)" : "" );
+
 	sv.state = SS_LOADING;
 	svs.autosave = qfalse;
 	svs.soundsNeedLoad = qfalse;
@@ -1038,6 +1044,8 @@ void SV_SpawnServer( const char *server, qboolean loadgame, qboolean restart, qb
 	if( g_gametype->integer != GT_SINGLE_PLAYER ) {
 		SV_ServerLoaded();
 	}
+
+	HzmDiag_LongOp( HZF_MAPLOAD_SV, 0, NULL ); // HZM coop [bug-3486]
 }
 
 /*
@@ -1255,6 +1263,7 @@ void SV_Shutdown( const char *finalmsg ) {
 	}
 
 	Com_Printf( "----- Server Shutdown (%s) -----\n", finalmsg );
+	HzmDiag_Event( "host: server shut down (%s)", finalmsg ); // HZM coop [bug-3486]
 
 	if ( svs.clients && !com_errorEntered ) {
 		SV_FinalMessage( finalmsg );

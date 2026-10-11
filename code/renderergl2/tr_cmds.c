@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "tr_local.h"
+#include "tr_hzm_perf.h" // HZM coop [bug-3486]
 
 static backEndCounters_t pc_save;
 
@@ -116,13 +117,16 @@ void R_IssueRenderCommands( qboolean runPerformanceCounters ) {
 	cmdList->used = 0;
 
 	if ( runPerformanceCounters ) {
+		R_HzmPerf_EndFrame(); // HZM coop [bug-3486] bug-report counts, before the counters are zeroed (tr_hzm_perf.c)
 		R_PerformanceCounters();
 	}
 
 	// actually start the commands going
 	if ( !r_skipBackEnd->integer ) {
 		// let it start on the new batch
+		R_HzmPerf_BackendBegin(); // HZM coop [bug-3486] the back end's real time, every flush (tr_hzm_perf.c)
 		RB_ExecuteRenderCommands( cmdList->cmds );
+		R_HzmPerf_BackendEnd();
 	}
 }
 
@@ -200,6 +204,8 @@ void	R_AddDrawSurfCmd( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 
 	cmd->refdef = tr.refdef;
 	cmd->viewParms = tr.viewParms;
+
+	R_HzmPerf_DrawSurfs( drawSurfs, numDrawSurfs ); // HZM coop [bug-3486] returns at once except on a sampled frame
 }
 
 

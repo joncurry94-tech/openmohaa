@@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "q_shared.h"
 #include "qcommon.h"
 #include "unzip.h"
+#include "hzm_diag.h" // HZM coop [bug-3486]
 
 #ifndef _WIN32
 #   include <sys/types.h>
@@ -1568,8 +1569,10 @@ long FS_FOpenFileRead(const char *filename, fileHandle_t *file, qboolean uniqueF
 		}
 		else if (*file)
 		{
-			if(len >= 0)
+			if(len >= 0) {
+				HzmDiag_NoteFile(filename); // HZM coop [bug-3486] what a long frame loaded: a counter and the first few names
 				return len;
+			}
 			FS_FCloseFile(*file);
 		}
 	}

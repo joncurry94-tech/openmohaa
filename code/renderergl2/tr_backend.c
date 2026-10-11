@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_local.h"
 #include "tr_fbo.h"
 #include "tr_dsa.h"
+#include "tr_hzm_perf.h" // HZM coop [bug-3486]
 #include "../renderercommon/hzm_storm.h" // HZM coop [2026-09-28] storm darkness
 
 backEndData_t	*backEndData;
@@ -2179,6 +2180,8 @@ const void	*RB_SwapBuffers( const void *data ) {
 	// HZM gl2 graphics probes: frame-end timestamp + readback of older frames, WCRC, glGetError drain.
 	R_GfxProbe_BackendFrameEnd();
 
+	R_HzmPerf_PresentBegin(); // HZM coop [bug-3486] time spent waiting for the GPU / the swap (tr_hzm_perf.c)
+
 	if ( !glState.finishCalled ) {
 		qglFinish();
 	}
@@ -2186,6 +2189,8 @@ const void	*RB_SwapBuffers( const void *data ) {
 	GLimp_LogComment( "***************** RB_SwapBuffers *****************\n\n\n" );
 
 	GLimp_EndFrame();
+
+	R_HzmPerf_PresentEnd();
 
 	backEnd.projection2D = qfalse;
 

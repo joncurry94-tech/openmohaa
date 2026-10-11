@@ -265,6 +265,25 @@ void* Sys_GetGameAPI(void* parms)
 
 /*
 =================
+Sys_GameSymbol / Sys_CGameSymbol
+
+HZM coop [bug-3486] an optional exported function of game.dll / cgame.dll, NULL when the DLL is not loaded or is an
+older build without it. The bug-report diagnostics use this instead of growing the import/export tables, so every
+mix of old and new binaries keeps working.
+=================
+*/
+void* Sys_GameSymbol(const char* name)
+{
+    return game_library ? Sys_LoadFunction(game_library, name) : NULL;
+}
+
+void* Sys_CGameSymbol(const char* name)
+{
+    return cgame_library ? Sys_LoadFunction(cgame_library, name) : NULL;
+}
+
+/*
+=================
 Sys_UnloadCGame
 =================
 */

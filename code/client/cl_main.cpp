@@ -32,6 +32,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../sys/sys_local.h"
 // HZM coop [bugreport_parity bug-3278] client/cl_bugreport.cpp
 void CL_BugReportInit( void );
+// HZM coop [bug-3486] bug-report diagnostics (qcommon/hzm_diag.h, cl_bugreport.cpp)
+#include "../qcommon/hzm_diag.h"
+extern "C" void CL_HzmNet( int what, int value );
+int cl_hzmRefGen; // bumped whenever the renderer DLL is loaded or unloaded: a cached renderer symbol is stale after that
 void CL_BugReportFrame( int msec );
 // HZM coop [dedicated_launch 2026-10-04] the coop start screen's Dedicated option (cl_dedicated.cpp)
 void CL_DedicatedInit( void );
@@ -1096,6 +1100,12 @@ void CL_Disconnect() {
 		}
 	}
 
+	// HZM coop [bug-3486] connection timeline (CL_Disconnect also runs when nothing is connected: only real ones count)
+	if ( clc.state >= CA_CONNECTING ) {
+		HzmDiag_Event( "client: disconnect (was %s%s)", clc.state == CA_ACTIVE ? "in game" : clc.state >= CA_LOADING ? "loading"
+						: "connecting", !Q_stricmp( clc.servername, "localhost" ) ? ", own server" : "" );
+	}
+
 	// shutting down the client so enter full screen ui mode
 	Cvar_Set("r_uiFullScreen", "1");
 
@@ -1439,6 +1449,7 @@ void CL_Reconnect_f( void ) {
 		return;
 	}
 	Cvar_Set("ui_singlePlayerActive", "0");
+	HzmDiag_Event( "client: reconnect requested" ); // HZM coop [bug-3486]
 	Cbuf_AddText( va("connect %s\n", clc.servername ) );
 }
 
@@ -1476,6 +1487,11 @@ void CL_Connect( const char *server, netadrtype_t family ) {
 	*/
 
 	Q_strncpyz( clc.servername, server, sizeof( clc.servername ) );
+
+	// HZM coop [bug-3486] connection timeline; the address itself is never recorded
+	HzmDiag_Flag( HZF_CONNECT );
+	HzmDiag_Event( "client: connecting to %s", !Q_stricmp( server, "localhost" ) ? "its own server" : "a server" );
+	CL_HzmNet( 4, 0 );
 
 	if( !NET_StringToAdr( clc.servername, &clc.serverAddress, family ) ) {
 		Com_Printf( "Bad server address\n" );
@@ -1730,6 +1746,7 @@ void CL_Vid_Restart_f( void ) {
 
 	Com_Printf("-------- CL_Vid_Restart_f --------\n");
 	cls.vid_restart = qtrue;
+	HzmDiag_LongOp( HZF_VID_RESTART, 1, "renderer restart" ); // HZM coop [bug-3486] hitch log + freeze watchdog
 
     //
     // Save the current music
@@ -1802,6 +1819,7 @@ void CL_Vid_Restart_f( void ) {
 
 	cls.vid_restart = qfalse;
 	Com_Printf("----- finished CL_Vid_Restart_f ----\n");
+	HzmDiag_LongOp( HZF_VID_RESTART, 0, NULL ); // HZM coop [bug-3486]
 }
 
 /*
@@ -1814,6 +1832,7 @@ handles will be invalid
 =================
 */
 void CL_Snd_Restart_f( void ) {
+	HzmDiag_Flag( HZF_SND_RESTART ); // HZM coop [bug-3486]
 #if defined(NO_MODERN_DMA) && NO_MODERN_DMA
 	S_Shutdown();
 	S_Init();
@@ -2584,6 +2603,7 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
 	if ( !Q_stricmp(c, "droperror") ) {
         reason = MSG_ReadString(msg);
         Com_Printf("Server dropped connection. Reason: %s", reason);
+        HzmDiag_Event( "client: the server refused the connection: %s", reason ); // HZM coop [bug-3486]
 		Cvar_Set("com_errorMessage", reason);
         CL_Disconnect_f();
         UI_ForceMenuOff(qtrue);
@@ -2645,8 +2665,17 @@ void CL_PacketEvent( netadr_t from, msg_t *msg ) {
 		return;
 	}
 
+	// HZM coop [bug-3486] duplicated / out-of-order packet: the same test Netchan_Process makes, counted here because its
+	// qfalse also covers "a fragment, more to come"
+	if ( ( LittleLong( *(int *)msg->data ) & 0x7fffffff ) <= clc.netchan.incomingSequence ) {
+		CL_HzmNet( 1, 1 );
+	}
+
 	if (!CL_Netchan_Process( &clc.netchan, msg) ) {
 		return;		// out of order, duplicated, etc
+	}
+	if ( clc.netchan.dropped > 0 ) {
+		CL_HzmNet( 0, clc.netchan.dropped ); // HZM coop [bug-3486] packets lost before this one
 	}
 
 	// the header is different lengths for reliable and unreliable messages
@@ -2704,6 +2733,7 @@ void CL_CheckTimeout( void ) {
 				bConsoleState = UI_ConsoleIsOpen();
 
 				Com_Printf("\nServer connection timed out.\n");
+				HzmDiag_Event( "client: server connection timed out (nothing received for %d s)", cl_timeout->integer ); // HZM coop [bug-3486]
 				SV_Shutdown("\nServer connection timed out\n");
 
 				if (com_cl_running && com_cl_running->integer) {
@@ -3078,12 +3108,28 @@ void CL_ShutdownRef( void ) {
 	}
 
 	Com_Memset( &re, 0, sizeof( re ) );
+	cl_hzmRefGen++; // HZM coop [bug-3486]
 
 #ifdef USE_RENDERER_DLOPEN
 	if ( rendererLib ) {
 		Sys_UnloadLibrary( rendererLib );
 		rendererLib = NULL;
 	}
+#endif
+}
+
+/*
+============
+CL_HzmRendererSymbol
+
+HZM coop [bug-3486] an optional exported function of the renderer DLL (R_HzmPerf), NULL when this renderer has none.
+============
+*/
+void *CL_HzmRendererSymbol( const char *name ) {
+#ifdef USE_RENDERER_DLOPEN
+	return rendererLib ? Sys_LoadFunction( rendererLib, name ) : NULL;
+#else
+	return NULL;
 #endif
 }
 
@@ -3518,6 +3564,7 @@ void CL_InitRef( void ) {
 	ri.SKEL_GetMorphWeightFrame = CL_RefSKEL_GetMorphWeightFrame;
 
 	ret = GetRefAPI( REF_API_VERSION, &ri );
+	cl_hzmRefGen++; // HZM coop [bug-3486]
 
 #if defined __USEA3D && defined __A3D_GEOM
 	hA3Dg_ExportRenderGeom (ret);

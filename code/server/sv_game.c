@@ -1587,6 +1587,8 @@ void SV_Free( void* ptr )
 	Z_Free( ptr );
 }
 
+void SV_HzmKeepScriptErrors( void ); // sv_hzmdiag.c [bug-3486]
+
 /*
 ===============
 SV_ShutdownGameProgs
@@ -1599,6 +1601,7 @@ void SV_ShutdownGameProgs( void ) {
 		return;
 	}
 
+	SV_HzmKeepScriptErrors(); // HZM coop [bug-3486] the ending map's script errors outlive the DLL (sv_hzmdiag.c)
 	ge->Shutdown();
 	Sys_UnloadGame();
 

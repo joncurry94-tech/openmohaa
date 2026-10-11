@@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "object.h"
 #include "worldspawn.h"
 #include "scriptcompiler.h"
+#include "g_hzmdiag.h" // HZM coop [bug-3486]
 #include "scriptexception.h"
 
 #ifdef WIN32
@@ -650,6 +651,7 @@ ScriptThread *ScriptMaster::CreateThread(GameScript *scr, str label, Listener *s
         return CreateScriptThread(scr, self, label);
     } catch (ScriptException& exc) {
         gi.DPrintf("ScriptMaster::CreateThread: %s\n", exc.string.c_str());
+        G_HzmScriptError("CreateThread", exc.string.c_str()); // HZM coop [bug-3486]
         return NULL;
     }
 }
@@ -675,6 +677,7 @@ void ScriptMaster::ExecuteThread(GameScript *scr, str label)
         }
     } catch (ScriptException& exc) {
         gi.DPrintf("ScriptMaster::ExecuteThread: %s\n", exc.string.c_str());
+        G_HzmScriptError("ExecuteThread", exc.string.c_str()); // HZM coop [bug-3486]
     }
 }
 
@@ -697,6 +700,7 @@ void ScriptMaster::ExecuteThread(GameScript *scr, str label, Event& parms)
         thread->Execute(parms);
     } catch (ScriptException& exc) {
         gi.DPrintf("ScriptMaster::ExecuteThread: %s\n", exc.string.c_str());
+        G_HzmScriptError("ExecuteThread", exc.string.c_str()); // HZM coop [bug-3486]
     }
 }
 
@@ -978,6 +982,7 @@ GameScript *ScriptMaster::GetScript(const_str filename, qboolean recompile)
         return GetGameScript(filename, recompile);
     } catch (ScriptException& exc) {
         gi.DPrintf("ScriptMaster::GetScript: %s\n", exc.string.c_str());
+        G_HzmScriptError("GetScript", exc.string.c_str()); // HZM coop [bug-3486]
     }
 
     return NULL;
@@ -989,6 +994,7 @@ GameScript *ScriptMaster::GetScript(str filename, qboolean recompile)
         return GetGameScript(filename, recompile);
     } catch (ScriptException& exc) {
         gi.DPrintf("ScriptMaster::GetScript: %s\n", exc.string.c_str());
+        G_HzmScriptError("GetScript", exc.string.c_str()); // HZM coop [bug-3486]
     }
 
     return NULL;

@@ -26,6 +26,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../qcommon/bg_compat.h"
 #include "../qcommon/cmd_filter.h" // HZM coop [SEC2] SrvFilter_GuardClass
 
+extern "C" void CL_HzmNet( int what, int value ); // HZM coop [bug-3486] cl_bugreport.cpp: connection quality for the report
+
 const char *svc_strings[256] = {
 	"svc_bad",
 
@@ -323,6 +325,9 @@ void CL_ParseSnapshot( msg_t *msg ) {
 		} else {
 			newSnap.valid = qtrue;	// valid delta parse
 		}
+		if ( !newSnap.valid ) {
+			CL_HzmNet( 2, 1 ); // HZM coop [bug-3486] a snapshot that could not be used
+		}
 	}
 
 	// read areamask
@@ -387,6 +392,7 @@ void CL_ParseSnapshot( msg_t *msg ) {
 			break;
 		}
 	}
+	CL_HzmNet( 3, cl.snap.ping ); // HZM coop [bug-3486] ping average / worst
 	// save the frame off in the backup array for later delta comparisons
 	cl.snapshots[cl.snap.messageNum & PACKET_MASK] = cl.snap;
 

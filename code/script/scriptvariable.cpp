@@ -2667,6 +2667,16 @@ void ScriptVariableList::Print(void (*PrintFn)(const char *format, ...))
     gi.Printf("%d variables\n", list.size());
 }
 
+// HZM coop [bug-3486] read-only walk (the bug report's level.coop_* dump, fgame/g_hzmdiag.cpp)
+void ScriptVariableList::HzmForEach(void (*fn)(const char *name, ScriptVariable& value, void *ud), void *ud)
+{
+    con_set_enum<short3, ScriptVariable> en = list;
+
+    for (con_set_enum<short3, ScriptVariable>::Entry *entry = en.NextElement(); entry; entry = en.NextElement()) {
+        (*fn)(entry->value.getName().c_str(), entry->value, ud);
+    }
+}
+
 CLASS_DECLARATION(Class, ScriptVariableList, NULL) {
     {NULL, NULL}
 };

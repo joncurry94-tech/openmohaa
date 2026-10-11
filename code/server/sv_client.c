@@ -24,6 +24,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "server.h"
 #include "../gamespy/sv_gamespy.h"
 #include "../qcommon/bg_compat.h"
+#include "../qcommon/hzm_diag.h" // HZM coop [bug-3486]
+
+void SV_HzmDiag_f( client_t *cl ); // sv_hzmdiag.c [bug-3486]
 
 static const unsigned int MAX_GAMESPY_IDS = (1 << 16);
 static unsigned int g_gamespyId = 1;
@@ -578,6 +581,7 @@ void SV_DirectConnect( netadr_t from ) {
 		else {
 			SV_NET_OutOfBandPrint( &svs.netprofile, from, "droperror\nServer is full.\n" );
 			Com_DPrintf ("Rejected a connection.\n");
+			HzmDiag_Event( "host: rejected a connection - server is full" ); // [bug-3486]
 			return;
 		}
 	}
@@ -618,6 +622,7 @@ gotnewcl:
 	if ( denied ) {
 		SV_NET_OutOfBandPrint( &svs.netprofile, from, "droperror\n%s\n", denied );
 		Com_DPrintf ( "Game rejected a connection: %s.\n", denied );
+		HzmDiag_Event( "host: the game rejected a connection: %s", denied ); // [bug-3486]
 		return;
 	}
 
@@ -640,6 +645,7 @@ gotnewcl:
 	SV_NET_OutOfBandPrint( &svs.netprofile, from, "connectResponse %d", challenge);
 
 	Com_DPrintf( "Going from CS_FREE to CS_CONNECTED for %s\n", newcl->name );
+	HzmDiag_Event( "host: client %d (%s) connected", clientNum, newcl->name ); // [bug-3486]
 
 	newcl->state = CS_CONNECTED;
 	if (svs.iNumClients > 1) {
@@ -714,6 +720,11 @@ void SV_DropClient( client_t *drop, const char *reason ) {
 	if ( drop->state == CS_ZOMBIE ) {
 		return;		// already dropped
 	}
+
+	// HZM coop [bug-3486] connection timeline: every drop, timeout, overflow and kick comes through here with its reason
+	HzmDiag_Event( "host: client %d (%s) dropped: %s [was %s, ping %d, %d s since its last packet]", (int)( drop - svs.clients ),
+		drop->name, reason ? reason : "?", drop->state == CS_ACTIVE ? "in game" : drop->state == CS_PRIMED ? "loading" : "connecting",
+		drop->ping, ( svs.time - drop->lastPacketTime ) / 1000 );
 
 	if ( !isBot ) {
 		// see if we already have a challenge for this ip
@@ -900,6 +911,7 @@ void SV_ClientEnterWorld( client_t *client, usercmd_t *cmd ) {
 	gentity_t *ent;
 
 	Com_DPrintf( "Going from CS_PRIMED to CS_ACTIVE for %s\n", client->name );
+	HzmDiag_Event( "host: client %d (%s) entered the game", (int)( client - svs.clients ), client->name ); // [bug-3486]
 	client->state = CS_ACTIVE;
 
 	// resend all configstrings using the cs commands since these are
@@ -1699,6 +1711,7 @@ static ucmd_t ucmds[] = {
 	{"nextdl", SV_NextDownload_f},
 	{"stopdl", SV_StopDownload_f},
 	{"donedl", SV_DoneDownload_f},
+	{"hzmdiag", SV_HzmDiag_f}, // HZM coop [bug-3486] a joiner's bug report asks for the mission state (rate-limited, a few KB)
 
 #ifdef USE_VOIP
 	{"voip", SV_Voip_f},
@@ -1842,7 +1855,9 @@ void SV_ClientThink (client_t *cl, usercmd_t *cmd) {
 		return;		// may have been kicked during the last usercmd
 	}
 
+	HzmDiag_Push( HZP_GAME ); // HZM coop [bug-3486] a player's move is game code, whichever phase its packet arrived in
 	ge->ClientThink( ( gentity_t * )SV_GentityNum( cl - svs.clients ), cmd, &cl->lastEyeinfo );
+	HzmDiag_Pop();
 
 	err = ge->errorMessage;
 	if( err )

@@ -24,6 +24,15 @@ report. The webhook comes only from FILES (updater.ini, else the loose coop_repo
 server could rewrite, only at send time, only if it is a Discord webhook URL, and reaches the child through its
 environment block, never argv. Servers cannot name any coop_report* cvar, command, menu or widget (cmd_filter.c).
 
+Diagnostics [bug-3486]: report_info.txt also carries where the player is, the mission state (objectives from the
+configstrings; players, AI and level.coop_* from the host's game - a joiner asks the host once with the reliable command
+`hzmdiag` when the menu opens and gets a few KB back), the script errors game.dll keeps regardless of `developer`, where
+the frame time goes, a hitch log, a per-map frame-rate history, a connection timeline and the newest freeze-watchdog
+files. The collectors are qcommon/hzm_diag.c (+ sv_hzmdiag.c, fgame/g_hzmdiag.cpp, cgame/cg_hzmdiag.cpp,
+renderergl2/tr_hzm_perf.c); the DLLs' parts are found by exported symbol, so any mix of old and new binaries just leaves
+a section saying "not available". All of it goes through BR_Scrub; server-supplied text is cleaned line by line, bounded
+and written behind a fixed prefix.
+
 BUGREPORT_SELFTEST builds only the pure helpers (scrubber, JSON, settings rule) with a main() for
 docs/proposals/bugreport_parity_2026-09-29/tools/selftest_scrub.py.
 ===========================================================================
@@ -45,6 +54,7 @@ docs/proposals/bugreport_parity_2026-09-29/tools/selftest_scrub.py.
 #	include "cl_ui.h"
 #	include "../server/server.h"
 #	include "../sys/sys_local.h"
+#	include "../qcommon/hzm_diag.h" // HZM coop [bug-3486]
 #endif
 
 #ifdef _WIN32
@@ -1866,6 +1876,281 @@ static void BR_WinNote( brwin_t *cur, brwin_t *last, int *start, int ms ) {
 
 /*
 ====================================================================================================================
+HZM coop [bug-3486] diagnostics the report prints (collectors: qcommon/hzm_diag.c; this file feeds and reads them).
+
+Everything in this block runs for every player, so it is deliberately tiny: a few timer reads per frame, and once a
+second a handful of counters. Nothing here is sent anywhere - it only becomes text when a report is prepared.
+====================================================================================================================
+*/
+extern int cl_hzmRefGen;                               // cl_main.cpp: changes when the renderer DLL is (un)loaded
+void      *CL_HzmRendererSymbol( const char *name );   // cl_main.cpp
+int        S_HzmChannelsPlaying( void );               // snd_openal_new.cpp
+extern "C" void *Sys_CGameSymbol( const char *name );  // sys/new/sys_main_new.c
+extern "C" int   SV_HzmGameText( int what, int clientNum, char *buf, int size ); // server/sv_hzmdiag.c
+extern "C" const char *SV_HzmPrevScriptErrors( void );                           // server/sv_hzmdiag.c
+
+typedef int ( *brRPerf_t )( long long *out, int n, int requestSample );
+typedef int ( *brCgDiag_t )( int *out, int n );
+
+// the renderer's optional R_HzmPerf (renderergl2/tr_hzm_perf.c); NULL with a renderer that has none
+static brRPerf_t BR_RPerf( void ) {
+	static brRPerf_t fn;
+	static int       gen = -1;
+	if ( gen != cl_hzmRefGen ) {
+		gen = cl_hzmRefGen;
+		fn  = (brRPerf_t)CL_HzmRendererSymbol( "R_HzmPerf" );
+	}
+	return fn;
+}
+
+// renderer back end: the DLL keeps running totals; the exe takes this frame's share
+typedef struct {
+	int       frames;
+	long long backendUs, presentUs, flushes;
+} brBeWin_t;
+static brBeWin_t s_beCur, s_beLast;
+static int       s_beWinStart;
+static long long s_beSeen[3], s_beInScene;
+static int       s_beGen = -1;
+static qboolean  s_beMeasured;
+
+/*
+====================
+CL_HzmRenderScene - cgame's R_RenderScene: re.RenderScene with a stopwatch. Whatever the back end flushed inside it is
+taken off again, so "front end" is the front end.
+====================
+*/
+void CL_HzmRenderScene( const refdef_t *fd ) {
+	brRPerf_t fn = BR_RPerf();
+	long long b0 = 0, b1 = 0;
+
+	if ( fn ) {
+		fn( &b0, 1, 0 );
+	}
+	HzmDiag_Push( HZP_FRONTEND );
+	re.RenderScene( fd );
+	if ( fn ) {
+		fn( &b1, 1, 0 );
+		if ( b1 > b0 ) {
+			HzmDiag_Nested( HZP_BACKEND, (unsigned long long)( b1 - b0 ) );
+			s_beInScene += b1 - b0; // already booked: CL_HzmDiagFrameEnd takes it off the frame's total
+		}
+	}
+	HzmDiag_Pop();
+}
+
+/*
+====================
+CL_HzmDiagFrameEnd - right after CL_Frame (qcommon/common.c): this frame's back-end time gets its own bucket
+====================
+*/
+extern "C" void CL_HzmDiagFrameEnd( void ) {
+	brRPerf_t fn = BR_RPerf();
+	long long v[3];
+	int       now;
+
+	if ( !fn || fn( v, 3, 0 ) < 3 ) {
+		s_beMeasured = qfalse;
+		return;
+	}
+	s_beMeasured = qtrue;
+	if ( s_beGen == cl_hzmRefGen && v[0] >= s_beSeen[0] && v[1] >= s_beSeen[1] && v[2] >= s_beSeen[2] ) {
+		now = Sys_Milliseconds();
+		if ( now - s_beWinStart >= 60000 || now < s_beWinStart ) {
+			s_beLast = s_beCur;
+			memset( &s_beCur, 0, sizeof( s_beCur ) );
+			s_beWinStart = now;
+		}
+		s_beCur.frames++;
+		s_beCur.backendUs += v[0] - s_beSeen[0];
+		s_beCur.presentUs += v[1] - s_beSeen[1];
+		s_beCur.flushes += v[2] - s_beSeen[2];
+		if ( v[0] - s_beSeen[0] > s_beInScene ) {
+			HzmDiag_Nested( HZP_BACKEND, (unsigned long long)( v[0] - s_beSeen[0] - s_beInScene ) );
+		}
+	}
+	s_beInScene = 0;
+	s_beGen = cl_hzmRefGen;
+	memcpy( s_beSeen, v, sizeof( s_beSeen ) );
+}
+
+// connection quality as this client sees it (cl_main.cpp CL_PacketEvent, cl_parse.cpp CL_ParseSnapshot)
+typedef struct {
+	int       since; // Sys_Milliseconds of the connect
+	int       lost, outOfOrder, badSnaps;
+	int       pings, pingMax;
+	long long pingSum;
+} brNet_t;
+static brNet_t s_net;
+static brwin_t s_pingCur, s_pingLast; // frames = samples, sumMs = ping sum, maxMs = worst
+static int     s_pingWinStart;
+
+/*
+====================
+CL_HzmNet - what: 0 packets lost, 1 duplicated / out-of-order packet, 2 unusable snapshot, 3 ping sample, 4 new connection
+====================
+*/
+extern "C" void CL_HzmNet( int what, int value ) {
+	switch ( what ) {
+	case 0:
+		s_net.lost += value;
+		break;
+	case 1:
+		s_net.outOfOrder += value;
+		break;
+	case 2:
+		s_net.badSnaps += value;
+		break;
+	case 3:
+		if ( value >= 0 && value < 999 ) {
+			s_net.pings++;
+			s_net.pingSum += value;
+			if ( value > s_net.pingMax ) {
+				s_net.pingMax = value;
+			}
+			BR_WinNote( &s_pingCur, &s_pingLast, &s_pingWinStart, value );
+		}
+		break;
+	case 4:
+		memset( &s_net, 0, sizeof( s_net ) );
+		memset( &s_pingCur, 0, sizeof( s_pingCur ) );
+		memset( &s_pingLast, 0, sizeof( s_pingLast ) );
+		s_net.since = Sys_Milliseconds();
+		break;
+	}
+}
+
+/*
+The host's mission state for a JOINER's report. This client asks with the reliable command `hzmdiag` when the report
+menu opens (at most once per 20 s); the host answers with a few reliable commands, `hzmdiag <n> <total> "<text>"`.
+The answer is hostile text like everything else a server sends: it is only accepted while a request is outstanding,
+bounded in pieces and bytes, stored as data, and printed later line by line through the cleaner and the scrubber.
+*/
+#define BR_STATE_CHUNKS   6
+#define BR_STATE_CHUNKLEN 760
+static char s_stChunk[BR_STATE_CHUNKS][BR_STATE_CHUNKLEN + 4];
+static int  s_stTotal, s_stHave;
+static int  s_stReqMs = -100000, s_stGotMs;
+static int  s_stServerId;
+
+static void BR_StateRequest( void ) {
+	int now = Sys_Milliseconds();
+	if ( clc.state != CA_ACTIVE || ( com_sv_running && com_sv_running->integer ) || clc.demoplaying ) {
+		return;
+	}
+	if ( now - s_stReqMs < 20000 && now >= s_stReqMs ) {
+		return;
+	}
+	memset( s_stChunk, 0, sizeof( s_stChunk ) );
+	s_stTotal = s_stHave = 0;
+	s_stReqMs    = now;
+	s_stGotMs    = 0;
+	s_stServerId = cl.serverId;
+	CL_AddReliableCommand( "hzmdiag", qfalse );
+}
+
+// cl_cgame.cpp CL_GetServerCommand, with the command already tokenized
+qboolean CL_HzmDiagReply( void ) {
+	int         now = Sys_Milliseconds();
+	int         seq = atoi( Cmd_Argv( 1 ) ), total = atoi( Cmd_Argv( 2 ) );
+	const char *text = Cmd_Argv( 3 );
+
+	if ( now - s_stReqMs > 30000 || now < s_stReqMs ) {
+		return qfalse; // never asked, or far too late
+	}
+	if ( total < 1 || total > BR_STATE_CHUNKS || seq < 0 || seq >= total || strlen( text ) > BR_STATE_CHUNKLEN ) {
+		return qfalse;
+	}
+	if ( s_stTotal && s_stTotal != total ) {
+		return qfalse;
+	}
+	if ( !s_stChunk[seq][0] ) {
+		s_stHave++;
+	}
+	s_stTotal = total;
+	Q_strncpyz( s_stChunk[seq], text[0] ? text : " ", sizeof( s_stChunk[seq] ) );
+	if ( s_stHave == total ) {
+		s_stGotMs = now ? now : 1;
+	}
+	return qtrue;
+}
+
+/*
+====================
+BR_DiagSample - about once a second while in a map: the counts the frame-time section and the fps history print
+====================
+*/
+static void BR_DiagSample( void ) {
+	int        counts[HZC_NUM];
+	long long  rp[9];
+	brRPerf_t  rfn = BR_RPerf();
+	brCgDiag_t cfn;
+	static long long s_lastSeq = -1;
+	static int       s_lastGen = -1;
+
+	for ( int i = 0; i < HZC_NUM; i++ ) {
+		counts[i] = -1;
+	}
+	counts[HZC_SNAP_ENTS] = cl.snap.valid ? cl.snap.numEntities : -1;
+	if ( rfn && rfn( rp, 9, 1 ) == 9 ) {
+		// a sample is only new when the renderer drew a frame since the last request
+		if ( s_lastGen == cl_hzmRefGen && rp[3] != s_lastSeq ) {
+			counts[HZC_VIEWS]        = (int)rp[4];
+			counts[HZC_DRAWSURFS]    = (int)rp[5];
+			counts[HZC_SKEL_SURFS]   = (int)rp[6];
+			counts[HZC_SKEL_MODELS]  = (int)rp[7];
+			counts[HZC_TESS_BATCHES] = (int)rp[8];
+		}
+		s_lastSeq = rp[3];
+		s_lastGen = cl_hzmRefGen;
+	}
+	cfn = cge ? (brCgDiag_t)Sys_CGameSymbol( "CG_HzmDiag" ) : NULL;
+	if ( cfn ) {
+		int c[2] = {-1, -1};
+		if ( cfn( c, 2 ) == 2 ) {
+			counts[HZC_TEMPMODELS] = c[0];
+			counts[HZC_EMITTERS]   = c[1];
+		}
+	}
+	counts[HZC_SND_CHANNELS] = S_HzmChannelsPlaying();
+	if ( com_sv_running && com_sv_running->integer ) {
+		int g[4];
+		if ( SV_HzmGameText( 4, clc.clientNum, (char *)g, sizeof( g ) ) == 4 ) {
+			counts[HZC_SV_ENTS]        = g[0];
+			counts[HZC_SV_AI_ENEMY]    = g[1];
+			counts[HZC_SV_AI_FRIENDLY] = g[2];
+			counts[HZC_SV_PLAYERS]     = g[3];
+		}
+	}
+	HzmDiag_CountSample( counts );
+}
+
+// every client frame, from CL_BugReportFrame
+static void BR_DiagFrame( void ) {
+	static int s_next, s_lastState = -1;
+	int        now = Sys_Milliseconds();
+
+	if ( (int)clc.state != s_lastState ) {
+		if ( clc.state == CA_ACTIVE ) {
+			HzmDiag_Event( "client: entered the game%s", ( com_sv_running && com_sv_running->integer ) ? " (own server)" : "" );
+			if ( com_sv_running && com_sv_running->integer ) {
+				CL_HzmNet( 4, 0 ); // a host never goes through CL_Connect: its counters start with each map
+			}
+		}
+		s_lastState = (int)clc.state;
+	}
+	if ( clc.state != CA_ACTIVE ) {
+		return;
+	}
+	HzmDiag_ClientActive( 1 );
+	if ( now >= s_next || now < s_next - 2000 ) {
+		s_next = now + 1000;
+		BR_DiagSample();
+	}
+}
+
+/*
+====================================================================================================================
 Release identity (user requirement 2026-09-29: every report states the installed release). The installed manifest
 version, coop_modVersion, the running binaries' md5 and whether each equals the manifest's sha256, and whether the
 updater started this game (the updater passes +set coop_reportLauncher updater; without it, updater.log's age
@@ -2092,6 +2377,266 @@ static void BR_Weather( char *line, size_t sz, brbuf_t *info, qboolean isHost, c
 					Q_strcat( line, (int)sz, ", storm now" );
 				}
 			}
+		}
+	}
+}
+
+/*
+====================================================================================================================
+HZM coop [bug-3486] the report's diagnostic sections. Every byte that did not originate in this process's own
+constants goes through BR_Scrub; anything a server supplied (map and objective text, the host's answer to a joiner,
+drop reasons) is also cleaned line by line first, cut to a bounded length and written behind a fixed prefix, so it
+cannot forge a section header, name a file or grow the report.
+====================================================================================================================
+*/
+#define BR_DIAG_TEXT 49152
+
+// scrub a block of our own text (LF or CRLF in, CRLF out) and append it
+static void BR_PutScrubbed( brbuf_t *out, const char *text, const brscrub_t *ctx ) {
+	brbuf_t s = {0};
+	BR_Scrub( text, strlen( text ), ctx, &s );
+	const char *p = BR_P( &s );
+	for ( size_t i = 0; i < s.n; i++ ) {
+		if ( p[i] == '\n' && ( i == 0 || p[i - 1] != '\r' ) ) {
+			BR_Put( out, "\r\n", 2 );
+		} else {
+			BR_Put( out, p + i, 1 );
+		}
+	}
+	BR_Free( &s );
+}
+
+// untrusted text, `sep`-separated lines: each line cleaned (no control bytes, colour codes, backticks), scrubbed,
+// cut at `maxLine` and written after `prefix`; at most `maxLines` lines
+static void BR_PutHostile( brbuf_t *out, const char *text, char sep, const char *prefix, const brscrub_t *ctx, int maxLine,
+						   int maxLines ) {
+	const char *p = text;
+	int         n = 0;
+	while ( *p && n < maxLines ) {
+		const char *e = strchr( p, sep );
+		size_t      l = e ? (size_t)( e - p ) : strlen( p );
+		char        raw[400], line[400];
+		if ( l >= sizeof( raw ) ) {
+			l = sizeof( raw ) - 1;
+		}
+		memcpy( raw, p, l );
+		raw[l] = 0;
+		BR_CleanScrub( raw, ctx, line, sizeof( line ), (size_t)maxLine );
+		if ( line[0] ) {
+			BR_Printf( out, "%s%s\r\n", prefix, line );
+			n++;
+		}
+		if ( !e ) {
+			break;
+		}
+		p = e + 1;
+	}
+}
+
+// the first line of `text` that starts with `key` (lines separated by `sep`), cleaned and scrubbed; "" when absent
+static void BR_FindLine( const char *text, char sep, const char *key, const brscrub_t *ctx, char *out, size_t outsz ) {
+	size_t      kl = strlen( key );
+	const char *p  = text;
+	out[0]         = 0;
+	while ( p && *p ) {
+		const char *e = strchr( p, sep );
+		if ( !strncmp( p, key, kl ) ) {
+			char   raw[400];
+			size_t l = e ? (size_t)( e - p ) : strlen( p );
+			if ( l >= sizeof( raw ) ) {
+				l = sizeof( raw ) - 1;
+			}
+			memcpy( raw, p, l );
+			raw[l] = 0;
+			BR_CleanScrub( raw, ctx, out, outsz, outsz - 1 );
+			return;
+		}
+		p = e ? e + 1 : NULL;
+	}
+}
+
+// the joiner's copy of the host's answer, pieces joined; qfalse when there is none for this connection
+static qboolean BR_StateJoined( char *out, size_t outsz ) {
+	out[0] = 0;
+	if ( !s_stGotMs || s_stServerId != cl.serverId || s_stTotal < 1 ) {
+		return qfalse;
+	}
+	for ( int i = 0; i < s_stTotal && i < BR_STATE_CHUNKS; i++ ) {
+		Q_strcat( out, (int)outsz, s_stChunk[i] );
+	}
+	return qtrue;
+}
+
+static void BR_DiagSections( brbuf_t *info, const brscrub_t *ctx, qboolean inMap, qboolean isHost ) {
+	static char text[BR_DIAG_TEXT];
+	static char mission[BR_DIAG_TEXT];
+	static char joined[BR_STATE_CHUNKS * ( BR_STATE_CHUNKLEN + 4 ) + 8];
+	qboolean    haveMission = qfalse, haveJoined = qfalse;
+	char        line[400];
+
+	mission[0] = joined[0] = 0;
+	if ( inMap && isHost ) {
+		haveMission = SV_HzmGameText( 1, clc.clientNum, mission, sizeof( mission ) ) > 0 ? qtrue : qfalse;
+	} else if ( inMap ) {
+		haveJoined = BR_StateJoined( joined, sizeof( joined ) );
+	}
+
+	// ---- 8. where the player is
+	if ( inMap ) {
+		float       best = -1;
+		int         bestIdx = -1;
+		const float *o = cl.snap.ps.origin;
+		BR_Puts( info, "\r\n=== where the player is ===\r\n" );
+		BR_CleanScrub( cl.mapname, ctx, line, sizeof( line ), 64 );
+		BR_Printf( info, "map=%s\r\norigin=(%.0f %.0f %.0f)\r\nview angles=(%.0f %.0f %.0f)\r\n", line, o[0], o[1], o[2],
+				   cl.snap.ps.viewangles[0], cl.snap.ps.viewangles[1], cl.snap.ps.viewangles[2] );
+		for ( int i = 0; i < MAX_OBJECTIVES; i++ ) {
+			const char *cs = BR_ConfigString( CS_OBJECTIVES + i );
+			float       v[3];
+			int         fl;
+			if ( !cs[0] ) {
+				continue;
+			}
+			fl = atoi( Info_ValueForKey( cs, "flags" ) );
+			if ( ( fl & ( OBJ_FLAG_HIDDEN | OBJ_FLAG_COMPLETED ) ) || sscanf( Info_ValueForKey( cs, "loc" ), "%f %f %f", &v[0], &v[1], &v[2] ) != 3 ) {
+				continue;
+			}
+			if ( v[0] == 0 && v[1] == 0 && v[2] == 0 ) {
+				continue; // no location given
+			}
+			float d = sqrtf( ( v[0] - o[0] ) * ( v[0] - o[0] ) + ( v[1] - o[1] ) * ( v[1] - o[1] ) + ( v[2] - o[2] ) * ( v[2] - o[2] ) );
+			if ( bestIdx < 0 || d < best ) {
+				best    = d;
+				bestIdx = i;
+			}
+		}
+		if ( bestIdx >= 0 ) {
+			BR_Printf( info, "nearest open objective=#%d, %.0f units away\r\n", bestIdx + 1, best );
+		} else {
+			BR_Puts( info, "nearest open objective=none with a location\r\n" );
+		}
+		if ( haveMission ) {
+			BR_FindLine( mission, '\n', "under the crosshair:", ctx, line, sizeof( line ) );
+			BR_Printf( info, "%s\r\n", line[0] ? line : "under the crosshair: (not given by the game)" );
+		} else if ( haveJoined ) {
+			BR_FindLine( joined, '`', "under the crosshair:", ctx, line, sizeof( line ) );
+			BR_Printf( info, "%s\r\n", line[0] ? line : "under the crosshair: (not given by the host)" );
+		} else {
+			BR_Puts( info, "under the crosshair: not available (needs the host's game; see mission state)\r\n" );
+		}
+	}
+
+	// ---- 4. mission state
+	if ( inMap ) {
+		int cur = atoi( BR_ConfigString( CS_CURRENT_OBJECTIVE ) ), shown = 0;
+		BR_Puts( info, "\r\n=== mission state ===\r\nobjectives (as this client was told; * = the current one):\r\n" );
+		for ( int i = 0; i < MAX_OBJECTIVES; i++ ) {
+			const char *cs = BR_ConfigString( CS_OBJECTIVES + i );
+			float       v[3] = {0, 0, 0};
+			char        txt[200];
+			int         fl;
+			if ( !cs[0] ) {
+				continue;
+			}
+			fl = atoi( Info_ValueForKey( cs, "flags" ) );
+			BR_CleanScrub( Info_ValueForKey( cs, "text" ), ctx, txt, sizeof( txt ), 160 );
+			sscanf( Info_ValueForKey( cs, "loc" ), "%f %f %f", &v[0], &v[1], &v[2] );
+			BR_Printf( info, " %c#%-2d %-9s %s  (at %.0f %.0f %.0f)\r\n", i == cur ? '*' : ' ', i + 1,
+					   ( fl & OBJ_FLAG_COMPLETED ) ? "COMPLETED" : ( fl & OBJ_FLAG_HIDDEN ) ? "hidden" : ( fl & OBJ_FLAG_CURRENT ) ? "CURRENT" : "open",
+					   txt, v[0], v[1], v[2] );
+			shown++;
+		}
+		if ( !shown ) {
+			BR_Puts( info, " (none set)\r\n" );
+		}
+		if ( haveMission ) {
+			BR_Puts( info, "from this machine's game (host):\r\n" );
+			BR_PutHostile( info, mission, '\n', "  ", ctx, 300, 300 );
+		} else if ( isHost ) {
+			BR_Puts( info, "players / AI / level.coop_*: not available (this game.dll does not export G_HzmDiag)\r\n" );
+		} else if ( haveJoined ) {
+			BR_Printf( info, "answered by the host %d s before this report (a joiner gets a short version, at most ~4 KB):\r\n",
+					   ( Sys_Milliseconds() - s_stGotMs ) / 1000 );
+			BR_PutHostile( info, joined, '`', "  host> ", ctx, 300, 120 );
+		} else {
+			BR_Puts( info, "players / AI / level.coop_*: not available on a joiner - the host did not answer the request "
+						   "(an older host, or the report was prepared before the answer arrived)\r\n" );
+		}
+	}
+
+	// ---- 7. script errors, kept by the game whether or not `developer` is set
+	BR_Puts( info, "\r\n=== script errors kept by the game (independent of `developer`) ===\r\n" );
+	if ( isHost && inMap && SV_HzmGameText( 3, clc.clientNum, text, sizeof( text ) ) > 0 ) {
+		BR_PutHostile( info, text, '\n', "", ctx, 380, 120 );
+	} else if ( isHost && inMap ) {
+		BR_Puts( info, "not available (this game.dll does not export G_HzmDiag)\r\n" );
+	} else if ( inMap ) {
+		BR_Puts( info, "scripts run on the host: see the host> lines in the mission state above for its count and newest three\r\n" );
+	} else {
+		BR_Puts( info, "no game running\r\n" );
+	}
+	if ( SV_HzmPrevScriptErrors()[0] ) {
+		// game.dll is unloaded with every map: the server kept the ending map's newest errors as text
+		BR_Puts( info, "the map before this one, on this machine's server (kept across the map change, newest 12):\r\n" );
+		BR_PutHostile( info, SV_HzmPrevScriptErrors(), '\n', "  ", ctx, 380, 16 );
+	}
+
+	// ---- 1. where the frame time goes
+	HzmDiag_Text( HZT_FRAME, text, sizeof( text ) );
+	BR_PutScrubbed( info, text, ctx );
+	{
+		const brBeWin_t *w = s_beLast.frames ? &s_beLast : &s_beCur;
+		if ( !s_beMeasured ) {
+			BR_Puts( info, "renderer back end: NOT measured (this renderer DLL has no R_HzmPerf) - its time is inside client+cgame above\r\n" );
+		} else if ( w->frames > 0 ) {
+			BR_Printf( info, "renderer back end: measured in the renderer around RB_ExecuteRenderCommands, %.1f flushes per frame; of its "
+							 "%.2f ms, %.2f ms is glFinish + the buffer swap (waiting for the GPU / vsync)\r\n",
+					   (double)w->flushes / w->frames, w->backendUs / 1000.0 / w->frames, w->presentUs / 1000.0 / w->frames );
+		}
+	}
+
+	// ---- 2. hitch log, 3. frame-rate history
+	HzmDiag_Text( HZT_HITCHES, text, sizeof( text ) );
+	BR_PutScrubbed( info, text, ctx );
+	HzmDiag_Text( HZT_FPS, text, sizeof( text ) );
+	BR_PutScrubbed( info, text, ctx );
+
+	// ---- 5. connection timeline
+	HzmDiag_Text( HZT_TIMELINE, text, sizeof( text ) );
+	BR_PutScrubbed( info, text, ctx );
+	if ( clc.state >= CA_CONNECTED ) {
+		const brwin_t *pw = s_pingLast.frames ? &s_pingLast : &s_pingCur;
+		BR_Printf( info, "this client's connection%s, %d s old: packets lost %d, duplicated/out-of-order %d, unusable snapshots %d",
+				   isHost ? " (to its own server)" : "", ( Sys_Milliseconds() - s_net.since ) / 1000, s_net.lost, s_net.outOfOrder,
+				   s_net.badSnaps );
+		if ( s_net.pings > 0 ) {
+			BR_Printf( info, "; ping avg %d ms, worst %d ms", (int)( s_net.pingSum / s_net.pings ), s_net.pingMax );
+		}
+		if ( pw->frames > 0 ) {
+			BR_Printf( info, " (last minute: avg %d, worst %d)", pw->sumMs / pw->frames, pw->maxMs );
+		}
+		BR_Puts( info, "\r\n" );
+	}
+
+	// ---- 6. freeze watchdog files
+	{
+		char paths[2][MAX_OSPATH];
+		int  n = HzmDiag_FreezeFiles( paths[0], MAX_OSPATH, 2 ), shown = 0;
+		BR_Puts( info, "\r\n=== freeze watchdog (main loop stuck > 5 s; newest 2 files of the last 30 days) ===\r\n" );
+		for ( int i = 0; i < n; i++ ) {
+			brbuf_t fr = {0};
+			time_t  fm = 0;
+			if ( BR_ReadTail( paths[i], 12 * 1024, &fr, &fm, NULL ) && fr.p && time( NULL ) - fm < 30 * 86400 ) {
+				const char *leaf = strrchr( paths[i], '\\' );
+				BR_Printf( info, "--- %s (%d h ago) ---\r\n", leaf ? leaf + 1 : "freeze file", (int)( ( time( NULL ) - fm ) / 3600 ) );
+				BR_PutScrubbed( info, fr.p, ctx );
+				BR_Puts( info, "\r\n" );
+				shown++;
+			}
+			BR_Free( &fr );
+		}
+		if ( !shown ) {
+			BR_Printf( info, "none (com_freezeWatch=%s)\r\n", Cvar_VariableString( "com_freezeWatch" ) );
 		}
 	}
 }
@@ -2397,6 +2942,7 @@ static void CL_BugReportOpen_f( void ) {
 		BR_Result( "" );
 	}
 	BR_PreviewClear();
+	BR_StateRequest(); // HZM coop [bug-3486] a joiner asks the host for the mission state now; it is here by REVIEW
 	// a game-view screenshot, only from inside a map (CL_BugReportFrame does the steps; the menu manager refuses
 	// ClearMenus while a PushMenu is still settling, so the close is retried, not assumed)
 	if ( clc.state == CA_ACTIVE && br_incShot->integer ) {
@@ -2649,10 +3195,15 @@ static void CL_BugReportPrepare_f( void ) {
 			}
 		}
 	}
+	// ---- [bug-3486] where the player is, mission state, script errors, frame time, hitches, fps history, timeline, freezes
+	BR_DiagSections( &info, &ctx, in.map[0] ? qtrue : qfalse, ( com_sv_running && com_sv_running->integer ) ? qtrue : qfalse );
 	BR_Puts( &info, "\r\n=== privacy ===\r\nScrubbed: home paths -> <HOME>, Windows user and PC name, player names "
 					"(yours and the ones in your game) -> <NAME>, IP addresses, webhook URLs, cd keys, password/rcon/token/key/auth/"
 					"bearer values, other players' userinfo, join codes.\r\n"
-					"Never read into this report: the cd-key file, unlock/save files, crash-dump memory.\r\n" );
+					"Never read into this report: the cd-key file, unlock/save files, crash-dump memory.\r\n"
+					"Diagnostics (frame timing, hitch log, frame-rate history, connection timeline, mission state, script errors, "
+					"freeze stacks) are numbers, game file names, map/script text and code addresses; they pass the same scrubber. "
+					"Server addresses and save-file names are never recorded.\r\n" );
 
 	// ---- texts, message, payload
 	brbuf_t t = {0};
@@ -2971,6 +3522,7 @@ CL_BugReportFrame - every client frame: the in-map fps average, the screenshot s
 ====================
 */
 void CL_BugReportFrame( int msec ) {
+	BR_DiagFrame(); // HZM coop [bug-3486] timeline + the once-a-second count sample
 	if ( clc.state == CA_ACTIVE && msec > 0 ) {
 		BR_WinNote( &s_clCur, &s_clLast, &s_clWinStart, msec );
 	}

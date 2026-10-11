@@ -139,6 +139,11 @@ cvar_t	*com_updatecheck_interval;
 int protocol_version_demo;
 int protocol_version_full;
 
+#include "hzm_diag.h" // HZM coop [bug-3486]
+#ifndef DEDICATED
+void CL_HzmDiagFrameEnd( void ); // client/cl_bugreport.cpp
+#endif
+
 // com_speeds times
 int		time_game;
 int		time_frontend;		// renderer frontend time
@@ -242,6 +247,11 @@ void QDECL Com_Printf( const char *fmt, ... ) {
 	va_start (argptr,fmt);
 	Q_vsnprintf (msg, sizeof(msg), fmt, argptr);
 	va_end(argptr);
+
+	// HZM coop [bug-3486] the one cgame line the connection timeline wants (a client that lost the snapshot stream)
+	if ( msg[0] == 'C' && msg[1] == 'G' && !strncmp( msg, "CG_ReadNextSnapshot: way out of range", 37 ) ) {
+		HzmDiag_Event( "client: %s", msg );
+	}
 
 	if ( rd_buffer ) {
 		if ((strlen (msg) + strlen(rd_buffer)) > (rd_buffersize - 1)) {
@@ -517,6 +527,11 @@ void QDECL Com_Error( int code, const char *fmt, ... ) {
 	va_start (argptr,fmt);
 	Q_vsnprintf (com_errorMessage,sizeof(com_errorMessage),fmt,argptr);
 	va_end (argptr);
+
+	// HZM coop [bug-3486] every error that ends a session goes on the connection timeline with its text
+	HzmDiag_Flag( HZF_ERROR_DROP );
+	HzmDiag_Event( "%s: %s", code == ERR_DROP ? "ERROR (drop)" : code == ERR_DISCONNECT ? "disconnected"
+							 : code == ERR_SERVERDISCONNECT ? "server disconnected" : "ERROR", com_errorMessage );
 
 	if (code != ERR_DISCONNECT && code != ERR_NEED_CD)
 		Cvar_Set("com_errorMessage", com_errorMessage);
@@ -1280,7 +1295,9 @@ void Com_RunAndTimeServerPacket( netadr_t *evFrom, msg_t *buf ) {
 		t1 = Sys_Milliseconds ();
 	}
 
+	HzmDiag_Push( HZP_SERVER ); // HZM coop [bug-3486] packets are handled inside the fps wait: that is not idle time
 	SV_PacketEvent( *evFrom, buf );
+	HzmDiag_Pop();
 
 	if ( com_speeds->integer ) {
 		t2 = Sys_Milliseconds ();
@@ -1313,7 +1330,9 @@ int Com_EventLoop( void ) {
 		if ( ev.evType == SE_NONE ) {
 			// manually send packet events for the loopback channel
 			while ( NET_GetLoopPacket( NS_CLIENT, &evFrom, &buf ) ) {
+				HzmDiag_Push( HZP_CLIENT ); // HZM coop [bug-3486]
 				CL_PacketEvent( evFrom, &buf );
+				HzmDiag_Pop();
 			}
 
 			while ( NET_GetLoopPacket( NS_SERVER, &evFrom, &buf ) ) {
@@ -2039,6 +2058,8 @@ void Com_Init( char *commandLine ) {
 
 	com_fullyInitialized = qtrue;
 
+	HzmDiag_Init(); // HZM coop [bug-3486] frame-phase timing, hitch log, timeline, freeze watchdog
+
 	// always set the cvar, but only print the info if it makes sense.
 	Com_DetectAltivec();
 #if idppc
@@ -2324,6 +2345,8 @@ void Com_Frame( void ) {
 	int		timeAfter;
   
 
+	HzmDiag_Frame(); // HZM coop [bug-3486] closes the previous frame's timing, feeds the freeze watchdog
+
 	if ( setjmp (abortframe) ) {
 		return;			// an ERR_DROP was thrown
 	}
@@ -2396,6 +2419,9 @@ void Com_Frame( void ) {
     else
         minMsec = 1;
 
+    HzmDiag_Mark( HZP_IDLE ); // HZM coop [bug-3486] the fps-cap wait is not work...
+    HzmDiag_IdleBudget( minMsec ); // ...unless it runs far past what was asked for (a stalled process)
+
     do
     {
         if (com_sv_running->integer)
@@ -2415,6 +2441,8 @@ void Com_Frame( void ) {
         else
             NET_Sleep(timeVal - 1);
     } while (Com_TimeVal(minMsec));
+
+    HzmDiag_Mark( HZP_EVENTS ); // HZM coop [bug-3486]
 
     IN_Frame();
 
@@ -2461,7 +2489,9 @@ void Com_Frame( void ) {
 
 	{
 		int hzmSvT0 = Sys_Milliseconds(); // HZM coop [bugreport_parity bug-3278]
+		HzmDiag_Mark( HZP_SERVER ); // HZM coop [bug-3486]
 		SV_Frame( msec );
+		HzmDiag_Mark( HZP_EVENTS );
 		Com_HzmNoteServerFrame( Sys_Milliseconds() - hzmSvT0, msec );
 	}
 
@@ -2508,7 +2538,10 @@ void Com_Frame( void ) {
 		timeBeforeClient = Sys_Milliseconds ();
 	}
 
+	HzmDiag_Mark( HZP_CLIENT ); // HZM coop [bug-3486]
 	CL_Frame( msec );
+	CL_HzmDiagFrameEnd(); // this frame's renderer back-end time gets its own bucket
+	HzmDiag_Mark( HZP_EVENTS );
 
 	if ( com_speeds->integer ) {
 		timeAfter = Sys_Milliseconds ();
@@ -2603,6 +2636,7 @@ Com_Shutdown
 =================
 */
 void Com_Shutdown (void) {
+	HzmDiag_Shutdown(); // HZM coop [bug-3486] stops the watchdog thread
 	if (logfile) {
 		FS_FCloseFile (logfile);
 		logfile = 0;

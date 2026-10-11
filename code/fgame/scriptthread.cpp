@@ -38,6 +38,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "consoleevent.h"
 #include "player.h"
 #include "lightstyleclass.h"
+#include "g_hzmdiag.h" // HZM coop [bug-3486]
 #include "debuglines.h"
 
 #include "scriptflags.h"
@@ -2733,6 +2734,7 @@ void ScriptThread::Execute(Event *ev)
             gi.Error(ERR_DROP, "%s\n", exc.string.c_str());
         } else {
             Com_Printf("^~^~^ Script Error: %s\n", exc.string.c_str());
+            G_HzmScriptError("Script Error (event)", exc.string.c_str()); // HZM coop [bug-3486]
         }
     }
 }

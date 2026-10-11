@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../fgame/level.h"
 #include "../fgame/parm.h"
 #include "../fgame/worldspawn.h"
+#include "../fgame/g_hzmdiag.h" // HZM coop [bug-3486]
 
 #include <utility>
 
@@ -2027,6 +2028,9 @@ void ScriptVM::HandleScriptException(ScriptException& exc)
     } else {
         gi.DPrintf("unknown source pos");
     }
+
+    // HZM coop [bug-3486] remembered for the bug report whether or not `developer` is set (the prints below stay gated)
+    G_HzmScriptError(exc.bAbort ? "Script Error (abort)" : "Script Error", exc.string.c_str());
 
     if (exc.bAbort) {
         ScriptException e(exc.string);

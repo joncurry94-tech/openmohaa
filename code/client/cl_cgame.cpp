@@ -27,6 +27,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../qcommon/tiki.h"
 #include "../qcommon/localization.h"
 #include "../qcommon/bg_compat.h"
+// HZM coop [bug-3486] bug-report diagnostics (qcommon/hzm_diag.h, cl_bugreport.cpp)
+#include "../qcommon/hzm_diag.h"
+void CL_HzmRenderScene( const refdef_t *fd );
+qboolean CL_HzmDiagReply( void );
 
 // HZM coop [SEC2] the last stufftext handed to cgame, so CL_CG_Stuff can tag it SERVER when a previous
 // cgame.dll (one without Cmd_StuffServer) relays it through cgi.Cmd_Stuff
@@ -466,6 +470,13 @@ qboolean CL_GetServerCommand( int serverCommandNumber, qboolean differentServer 
 		cmd = Cmd_Argv(0);
 	}
 
+	// HZM coop [bug-3486] the host's answer to this client's `hzmdiag` request (a joiner's bug report): kept by the exe,
+	// never shown to cgame, ignored unless it was asked for
+	if ( !strcmp( cmd, "hzmdiag" ) ) {
+		CL_HzmDiagReply();
+		return qfalse;
+	}
+
 	// HZM coop [SEC2] remember a stufftext's text for CL_CG_Stuff (a previous cgame.dll relays it right
 	// after this returns)
 	cl_cgPendingStuff = qfalse;
@@ -780,7 +791,7 @@ void CL_InitCGameDLL( clientGameImport_t *cgi, clientGameExport_t **cge ) {
 	cgi->get_camera_offset			= get_camera_offset;
 	
 	cgi->R_ClearScene				= re.ClearScene;
-	cgi->R_RenderScene				= re.RenderScene;
+	cgi->R_RenderScene				= CL_HzmRenderScene; // HZM coop [bug-3486] re.RenderScene, timed (renderer front end)
 
 	cgi->R_LoadWorldMap				= re.LoadWorld;
 	cgi->R_PrintBSPFileSizes		= re.PrintBSPFileSizes;
@@ -1007,6 +1018,13 @@ void CL_InitCGame( void ) {
 	info = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
 	mapname = Info_ValueForKey( info, "mapname" );
 
+	// HZM coop [bug-3486] a map load is a legitimately long frame; a joiner's map comes from here (a host's from SV_SpawnServer)
+	HzmDiag_LongOp( HZF_MAPLOAD_CL, 1, "client map load" );
+	if ( !com_sv_running->integer ) {
+		HzmDiag_SetMap( mapname );
+		HzmDiag_Event( "client: loading map %s", mapname );
+	}
+
 	// HZM [bug-2836] adopt the server's MAP VARIANT before cgame loads collision (CM_LoadMap) and the world
 	// (R_LoadWorldMap -> R_InitStaticModels), so this client strips exactly the brushes / static models the server
 	// did. A server without the key (vanilla / older build) publishes nothing -> "" -> unpatched, matching it.
@@ -1062,6 +1080,7 @@ void CL_InitCGame( void ) {
 	t2 = Sys_Milliseconds();
 
 	Com_Printf( "CL_InitCGame: %5.2f seconds\n", ( t2 - t1 ) / 1000.0 );
+	HzmDiag_LongOp( HZF_MAPLOAD_CL, 0, NULL ); // HZM coop [bug-3486]
 }
 
 

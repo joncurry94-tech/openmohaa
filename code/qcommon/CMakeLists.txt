@@ -67,6 +67,7 @@ set(SOURCES_COMMON
 	"${CMAKE_SOURCE_DIR}/code/qcommon/crc.c"
 	"${CMAKE_SOURCE_DIR}/code/qcommon/cvar.c"
 	"${CMAKE_SOURCE_DIR}/code/qcommon/files.cpp"
+	"${CMAKE_SOURCE_DIR}/code/qcommon/hzm_diag.c"
 	"${CMAKE_SOURCE_DIR}/code/qcommon/ioapi.c"
 	"${CMAKE_SOURCE_DIR}/code/qcommon/huffman.cpp"
 	"${CMAKE_SOURCE_DIR}/code/qcommon/md4.c"

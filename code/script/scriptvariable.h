@@ -346,6 +346,8 @@ public:
 
     void Archive(Archiver& arc) override;
     void Print(void (*PrintFn)(const char *format, ...));
+    // HZM coop [bug-3486] read-only walk (the bug report's level.coop_* dump, fgame/g_hzmdiag.cpp)
+    void HzmForEach(void (*fn)(const char *name, ScriptVariable& value, void *ud), void *ud);
     void MakePrimitive();
 };
 

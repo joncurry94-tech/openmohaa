@@ -6708,3 +6708,28 @@ unsigned int openal_channel_two_d_stream::getBitsPerSample() const
 
     return bits * channels;
 }
+
+/*
+==============
+S_HzmChannelsPlaying
+
+HZM coop [bug-3486] how many channels are playing right now, for the bug report's once-a-second sample. -1 = no sound.
+==============
+*/
+int S_HzmChannelsPlaying(void)
+{
+    int i, n = 0;
+
+    if (!s_bSoundStarted) {
+        return -1;
+    }
+
+    for (i = 0; i < MAX_SOUNDSYSTEM_POSITION_CHANNELS; i++) {
+        openal_channel *pChannel = openal.channel[i];
+        if (pChannel && pChannel->is_playing()) {
+            n++;
+        }
+    }
+
+    return n;
+}

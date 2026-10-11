@@ -30,6 +30,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "scriptclass.h"
 #include "scriptexception.h"
 #include "level.h"
+#include "g_hzmdiag.h" // HZM coop [bug-3486]
 
 static unsigned char *current_progBuffer = NULL;
 
@@ -188,6 +189,8 @@ void AbstractScript::PrintSourcePos(str sourceLine, int column, int line, bool d
     }
 
     markerLine.append("^");
+
+    G_HzmScriptErrorPos(Filename().c_str(), line, sourceLine.c_str()); // HZM coop [bug-3486] where the next recorded script error is
 
     gi.DPrintf("(%s, %d):\n%s\n%s\n", Filename().c_str(), line, sourceLine.c_str(), markerLine.c_str());
 }
@@ -746,6 +749,7 @@ void GameScript::Load(const void *sourceBuffer, size_t sourceLength)
     m_PreprocessedBuffer = Compiler.Preprocess(m_SourceBuffer);
     if (!Compiler.Parse(this, m_PreprocessedBuffer, "script", nodeLength)) {
         gi.DPrintf2("^~^~^ Script file compile error:  Couldn't parse '%s'\n", Filename().c_str());
+        G_HzmScriptError("parse", va("Couldn't parse '%s'", Filename().c_str())); // HZM coop [bug-3486]
         return Close();
     }
 
@@ -762,6 +766,7 @@ void GameScript::Load(const void *sourceBuffer, size_t sourceLength)
 
     if (!Compiler.Compile(this, m_ProgBuffer, m_ProgLength)) {
         gi.DPrintf2("^~^~^ Script file compile error:  Couldn't compile '%s'\n", Filename().c_str());
+        G_HzmScriptError("compile", va("Couldn't compile '%s'", Filename().c_str())); // HZM coop [bug-3486]
         return Close();
     }
 

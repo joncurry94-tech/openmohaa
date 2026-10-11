@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "../qcommon/hzm_diag.h" // HZM coop [bug-3486]
 #include "../qcommon/net_rendezvous.h" // HZM coop [238]
 #include "../gamespy/sv_gamespy.h"
 #include "../gamespy/sv_gqueryreporting.h"
@@ -216,6 +217,8 @@ void SV_ParkClear( client_t *client ) {
 	if ( pk->peak >= 256 ) {
 		Com_Printf( "^~^~^ SVCMDPARK client=%d cleared with %d parked (peak %d)\n", (int)( client - svs.clients ),
 			pk->count, pk->peak );
+		HzmDiag_Event( "host: SVCMDPARK client=%d cleared with %d parked (peak %d)", (int)( client - svs.clients ),
+			pk->count, pk->peak ); // [bug-3486]
 	}
 	for ( n = pk->head ; n ; n = next ) {
 		next = n->next;
@@ -259,6 +262,7 @@ void SV_ParkDrain( client_t *client ) {
 	if ( !pk->head && fed ) {
 		if ( pk->peak >= 256 ) {
 			Com_Printf( "^~^~^ SVCMDPARK client=%d caught up (peak %d parked)\n", (int)( client - svs.clients ), pk->peak );
+			HzmDiag_Event( "host: SVCMDPARK client=%d caught up (peak %d parked)", (int)( client - svs.clients ), pk->peak ); // [bug-3486]
 		}
 		pk->peak = 0;
 		pk->reported = 0;
@@ -334,6 +338,9 @@ static void SV_CmdQueueReport( client_t *client, int pending ) {
 	Com_Printf( "^~^~^ SVCMDQ client=%d state=%d waiting=%d (in flight %d, parked %d):%s other=%d\n",
 		(int)( client - svs.clients ), (int)client->state, pending,
 		client->reliableSequence - client->reliableAcknowledge, pk ? pk->count : 0, line, other );
+	HzmDiag_Event( "host: SVCMDQ client=%d state=%d waiting=%d (in flight %d, parked %d):%s other=%d",
+		(int)( client - svs.clients ), (int)client->state, pending,
+		client->reliableSequence - client->reliableAcknowledge, pk ? pk->count : 0, line, other ); // [bug-3486]
 }
 
 /*
@@ -385,6 +392,7 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 
 		if ( pk->count >= SV_PARK_MAX ) {
 			Com_Printf( "^~^~^ SVCMDPARK client=%d park full (%d) - dropping\n", (int)( client - svs.clients ), pk->count );
+			HzmDiag_Event( "host: SVCMDPARK client=%d park full (%d) - dropping", (int)( client - svs.clients ), pk->count ); // [bug-3486]
 			SV_CmdQueueReport( client, pk->count + client->reliableSequence - client->reliableAcknowledge );
 			SV_DropClient( client, "Server command overflow" );
 			return;
@@ -1458,7 +1466,9 @@ void SV_Frame( int msec ) {
 			const char *err;
 
 			// let everything in the world think and move
+			HzmDiag_Push( HZP_GAME ); // HZM coop [bug-3486] game/AI time, always measured
 			ge->RunFrame( svs.time, frameMsec );
+			HzmDiag_Pop();
 
 			err = ge->errorMessage;
 			if( err )

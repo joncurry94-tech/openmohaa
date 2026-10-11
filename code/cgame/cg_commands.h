@@ -941,6 +941,7 @@ public:
     CLASS_PROTOTYPE(ClientGameCommandManager);
 
     ClientGameCommandManager();
+    int  HzmDiagCounts(int *out, int n); // HZM coop [bug-3486] temp models / emitters alive, for the bug report (cg_hzmdiag.cpp)
     void AddTempModels(void);
     void UpdateEmitter(dtiki_t *tiki, vec3_t axis[3], int entity_number, int parent_number, Vector entity_origin);
     void UpdateBeam(dtiki_t *tiki, int entity_number, spawnthing_t *beamthing);

@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qcommon.h"
+#include "../qcommon/hzm_diag.h" // HZM coop [bug-3486]
 
 #ifdef _WIN32
 #	include <winsock2.h>
@@ -1645,7 +1646,13 @@ void NET_Event(fd_set *fdr)
 			if(com_sv_running->integer)
 				Com_RunAndTimeServerPacket(&from, &netmsg);
 			else
+			{
+				// HZM coop [bug-3486] a remote server's packets arrive inside the fps wait: a joiner's map load and snapshot
+				// parsing are client work, not idle time
+				HzmDiag_Push( HZP_CLIENT );
 				CL_PacketEvent(from, &netmsg);
+				HzmDiag_Pop();
+			}
 		}
 		else
 			break;
