@@ -344,6 +344,12 @@ static void HZ_TextMission(hzOut_t *o, int clientNum, bool compact)
             state = "alive";
         }
         HZ_Clean(ed->client->pers.netname, name, sizeof(name));
+        if (compact && i != clientNum) {
+            // the answer to a joiner never says where anyone else is or how hurt they are: on a PvP map that would be a
+            // wallhack any client could poll
+            HZ_Out(o, "  client %d %s: %s\n", i, name, state);
+            continue;
+        }
         HZ_Out(o, "  client %d %s: %s, health %d/%d, at (%d %d %d)%s\n", i, name, state, (int)p->health, (int)p->max_health,
                (int)p->origin[0], (int)p->origin[1], (int)p->origin[2], i == clientNum ? "  <- the reporting player" : "");
     }
