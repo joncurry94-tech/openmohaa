@@ -2197,9 +2197,11 @@ void Com_WriteConfiguration( void ) {
 	}
 
 	// HZM coop [bug-3490] AT MOST ONCE EVERY 10 SECONDS. This runs every frame and rewrites the WHOLE config -
-	// bindings, a few thousand cvars, the aliases - the moment any archived cvar changes, and in this mod
-	// they change all the time during play: the server's `seta` menu and HUD mirrors (challenge rows, loadout,
-	// objectives), cgame's own state. Profile of Omaha, idle player: 4.1 % of the main thread inside
+	// bindings, a few thousand cvars, the aliases - the moment any archived cvar changes. The one that was
+	// changing every frame on Omaha turned out to be the scripted audio duck fading s_musicvolume and
+	// s_ambientvolume (measured with developer 2; NOT the menu/HUD mirrors first blamed here) - that is fixed at
+	// the source in cvar.c Cvar_HzmDuckSaveFor, and this spacing stays as the backstop for whatever else does it
+	// (server-stuffed s_volume fades, the breath-hold duck). Profile of Omaha, idle player: 4.1 % of the main thread inside
 	// Com_WriteConfigToFile, arriving as bursts of file create + write on the frame - a stutter source on any
 	// disk and a bad one behind a virus scanner. The flag simply stays set until the next allowed write, so
 	// nothing is lost; Com_Quit_f forces the last one (com_writeConfigNow).

@@ -603,6 +603,58 @@ void Cvar_Print( cvar_t *v ) {
 
 /*
 ============
+Cvar_HzmDuckSaveFor
+
+HZM coop [user 2026-10-11, bug-3490] "why does the menu/HUD trigger that and does it need to save every 10 seconds?"
+It was not the menus. Measured on Omaha with developer 2 (40 s, player standing still): exactly two archived cvars
+were changing, s_musicvolume and s_ambientvolume, ~30 times a second each. cgame's scripted audio duck
+(cg_view.c CG_UpdateScriptedAudioDucks) fades the player's own volume sliders, they are CVAR_ARCHIVE, and every step
+marked the whole config dirty - so the engine rewrote the settings file on every frame of a fade that lasts minutes
+on that map.
+
+A fade is not a setting changing. While a duck is in flight cgame keeps the player's real value in
+coop_duckSaveMusic / coop_duckSaveAmbient (>= 0; -1 when no duck is running, bug-2551), so:
+  - a change to one of the two volumes while its save is >= 0 does not mark the config dirty, and neither does a
+    change to the save cvars themselves;
+  - Cvar_WriteVariables writes the SAVED value for the volume and -1 for the save.
+The file therefore always holds the player's own volume and never a mid-fade one, which is also the bug-2551 latch
+(quit inside a duck and the ducked value persists) closed at the source rather than healed at the next launch. The
+heal stays for configs written by older builds.
+
+Returns the save cvar when `var` is a volume with a duck in flight, `var` itself when it is one of the save cvars,
+NULL otherwise.
+============
+*/
+static cvar_t *Cvar_HzmDuckSaveFor( cvar_t *var ) {
+	cvar_t	*save;
+
+	if ( !var->name ) {
+		return NULL;
+	}
+	if ( var->name[ 0 ] == 'c' || var->name[ 0 ] == 'C' ) {
+		if ( !Q_stricmp( var->name, "coop_duckSaveMusic" ) || !Q_stricmp( var->name, "coop_duckSaveAmbient" ) ) {
+			return var;
+		}
+		return NULL;
+	}
+	if ( var->name[ 0 ] != 's' && var->name[ 0 ] != 'S' ) {
+		return NULL;
+	}
+	if ( !Q_stricmp( var->name, "s_musicvolume" ) ) {
+		save = Cvar_FindVar( "coop_duckSaveMusic" );
+	} else if ( !Q_stricmp( var->name, "s_ambientvolume" ) ) {
+		save = Cvar_FindVar( "coop_duckSaveAmbient" );
+	} else {
+		return NULL;
+	}
+	if ( save && save->string[ 0 ] && save->value >= 0.0f ) {
+		return save;
+	}
+	return NULL;
+}
+
+/*
+============
 Cvar_Set2
 ============
 */
@@ -660,7 +712,12 @@ cvar_t *Cvar_Set2( const char *var_name, const char *value, qboolean force ) {
 		return var;
 
 	// note what types of cvars have been modified (userinfo, archive, serverinfo, systeminfo)
-	cvar_modifiedFlags |= var->flags;
+	// HZM coop [bug-3490] ...except a volume that is only being FADED: that is not a setting changing
+	if ( ( var->flags & CVAR_ARCHIVE ) && Cvar_HzmDuckSaveFor( var ) ) {
+		cvar_modifiedFlags |= var->flags & ~CVAR_ARCHIVE;
+	} else {
+		cvar_modifiedFlags |= var->flags;
+	}
 
 	if (!force)
 	{
@@ -1245,6 +1302,16 @@ void Cvar_WriteVariables(fileHandle_t f)
 			continue;
 
 		if( var->flags & CVAR_ARCHIVE ) {
+			// HZM coop [bug-3490] a volume with a duck in flight is written as the player's own value, and the
+			// save that carries it as "nothing to recover" - see Cvar_HzmDuckSaveFor
+			cvar_t *duckSave = Cvar_HzmDuckSaveFor( var );
+
+			if ( duckSave ) {
+				Com_sprintf( buffer, sizeof( buffer ), "seta %s \"%s\"\n", var->name,
+					duckSave == var ? "-1" : duckSave->string );
+				FS_Write( buffer, strlen( buffer ), f );
+				continue;
+			}
 			// write the latched value, even if it hasn't taken effect yet
 			if ( var->latchedString ) {
 				if( strlen( var->name ) + strlen( var->latchedString ) + 10 > sizeof( buffer ) ) {
