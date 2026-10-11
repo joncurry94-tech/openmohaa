@@ -154,6 +154,67 @@ int SV_ReplacePendingServerCommands( client_t *client, const char *cmd ) {
 
 /*
 ======================
+SV_CmdQueueReport
+
+HZM coop [bug-3480, tester report 2026-10-10: "<player> Server command overflow"]
+One line saying WHAT is sitting in a client's reliable-command queue, by command name (and, for a stufftext, by
+the command it carries). Printed as the queue crosses 256 / 512 / 768 / 1000 of MAX_RELIABLE_COMMANDS, so a host's
+log shows what is flooding a client long before - and whether or not - the client is dropped for it.
+======================
+*/
+static void SV_CmdQueueReport( client_t *client, int pending ) {
+	char		names[14][28];
+	int			counts[14];
+	int			n = 0, other = 0, i, k, len, j;
+	const char	*c;
+	char		tok[28];
+	char		line[640];
+
+	for ( i = client->reliableAcknowledge + 1 ; i <= client->reliableSequence ; i++ ) {
+		c = client->reliableCommands[ i & (MAX_RELIABLE_COMMANDS-1) ];
+		len = 0;
+		while ( c[len] && c[len] != ' ' && len < 12 ) {
+			tok[len] = c[len];
+			len++;
+		}
+		tok[len] = 0;
+		if ( !strcmp( tok, "stufftext" ) ) {
+			// stufftext "set coop_x 1" -> stufftext:set
+			j = len;
+			while ( c[j] == ' ' || c[j] == '"' ) {
+				j++;
+			}
+			tok[len++] = ':';
+			while ( c[j] && c[j] != ' ' && c[j] != '"' && c[j] != '\n' && len < (int)sizeof( tok ) - 1 ) {
+				tok[len++] = c[j++];
+			}
+			tok[len] = 0;
+		}
+		for ( k = 0 ; k < n ; k++ ) {
+			if ( !strcmp( names[k], tok ) ) {
+				break;
+			}
+		}
+		if ( k < n ) {
+			counts[k]++;
+		} else if ( n < 14 ) {
+			Q_strncpyz( names[n], tok, sizeof( names[n] ) );
+			counts[n] = 1;
+			n++;
+		} else {
+			other++;
+		}
+	}
+	line[0] = 0;
+	for ( k = 0 ; k < n ; k++ ) {
+		Q_strcat( line, sizeof( line ), va( " %s=%d", names[k], counts[k] ) );
+	}
+	Com_Printf( "^~^~^ SVCMDQ client=%d state=%d pending=%d of %d:%s other=%d\n", (int)( client - svs.clients ),
+		(int)client->state, pending, MAX_RELIABLE_COMMANDS, line, other );
+}
+
+/*
+======================
 SV_AddServerCommand
 
 The given command will be transmitted to the client, and is guaranteed to
@@ -210,6 +271,12 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 	}
 	index = client->reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 );
 	Q_strncpyz( client->reliableCommands[ index ], cmd, sizeof( client->reliableCommands[ index ] ) );
+
+	// HZM coop [bug-3480] say what the queue holds as it fills (see SV_CmdQueueReport)
+	i = client->reliableSequence - client->reliableAcknowledge;
+	if ( i == 256 || i == 512 || i == 768 || i == 1000 ) {
+		SV_CmdQueueReport( client, i );
+	}
 }
 
 
