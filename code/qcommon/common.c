@@ -592,6 +592,8 @@ Both client and server can use this, and it will
 do the appropriate things.
 =============
 */
+void Com_WriteConfigurationNow( void );
+
 void Com_Quit_f( void ) {
 	// don't try to shutdown if we are in a recursive error
 	char *p = Cmd_Args( );
@@ -600,6 +602,9 @@ void Com_Quit_f( void ) {
 		// which would trigger an unload of active VM error.
 		// Sys_Quit will kill this process anyways, so
 		// a corrupt call stack makes no difference
+		// HZM coop [bug-3490] config writes are spaced 10 s apart now, so the last change may still be
+		// waiting: write it before anything is torn down
+		Com_WriteConfigurationNow();
 		VM_Forced_Unload_Start();
 		SV_Shutdown(p[0] ? p : "Server quit");
 		CL_Shutdown(p[0] ? p : "Client quit", qtrue, qtrue);
@@ -2175,6 +2180,8 @@ Com_WriteConfiguration
 Writes key bindings and archived cvars to config file if modified
 ===============
 */
+static qboolean com_writeConfigNow = qfalse;	// HZM coop [bug-3490] set to skip the 10 s spacing once (quit)
+
 void Com_WriteConfiguration( void ) {
 #ifndef DEDICATED
 	cvar_t	*fs;
@@ -2188,6 +2195,24 @@ void Com_WriteConfiguration( void ) {
 	if ( !(cvar_modifiedFlags & CVAR_ARCHIVE ) ) {
 		return;
 	}
+
+	// HZM coop [bug-3490] AT MOST ONCE EVERY 10 SECONDS. This runs every frame and rewrites the WHOLE config -
+	// bindings, a few thousand cvars, the aliases - the moment any archived cvar changes, and in this mod
+	// they change all the time during play: the server's `seta` menu and HUD mirrors (challenge rows, loadout,
+	// objectives), cgame's own state. Profile of Omaha, idle player: 4.1 % of the main thread inside
+	// Com_WriteConfigToFile, arriving as bursts of file create + write on the frame - a stutter source on any
+	// disk and a bad one behind a virus scanner. The flag simply stays set until the next allowed write, so
+	// nothing is lost; Com_Quit_f forces the last one (com_writeConfigNow).
+	{
+		static int lastWrite = 0;
+		int        now = Sys_Milliseconds();
+
+		if ( !com_writeConfigNow && lastWrite && now >= lastWrite && now - lastWrite < 10000 ) {
+			return;
+		}
+		lastWrite = now ? now : 1;
+		com_writeConfigNow = qfalse;
+	}
 	cvar_modifiedFlags &= ~CVAR_ARCHIVE;
 
 	Com_WriteConfigToFile( config->string );
@@ -2196,6 +2221,19 @@ void Com_WriteConfiguration( void ) {
 #ifndef DEDICATED
 	fs = Cvar_Get ("fs_game", "", CVAR_INIT|CVAR_SYSTEMINFO );
 #endif
+}
+
+/*
+===============
+Com_WriteConfigurationNow
+
+HZM coop [bug-3490] the same, without the 10 second spacing
+===============
+*/
+void Com_WriteConfigurationNow( void ) {
+	com_writeConfigNow = qtrue;
+	Com_WriteConfiguration();
+	com_writeConfigNow = qfalse;
 }
 
 

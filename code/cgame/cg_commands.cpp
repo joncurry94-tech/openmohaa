@@ -4887,6 +4887,34 @@ void ClientGameCommandManager::UpdateEmitter(
         entnum = ENTITYNUM_NONE;
     }
 
+    // HZM coop [bug-3491] MOST MODELS HAVE NO EMITTER, AND THIS RAN THE WHOLE LIST FOR EACH OF THEM.
+    // UpdateEmitter is called for every entity and temp model that has a tiki, and the loop below walks every
+    // emitter the map has registered just to compare model pointers: entities x emitters, every frame - 8-10 %
+    // of the main thread on Omaha (1,400 entities). A small bit filter over the model pointers that DO own an
+    // emitter answers "none of them is yours" at once. It is rebuilt whenever the frame or the emitter count
+    // changes, so an emitter registered a moment ago is always in it; a false positive only costs the walk.
+    {
+        static unsigned char s_emFilter[1024];
+        static int           s_emFilterTime  = -1;
+        static int           s_emFilterCount = -1;
+        unsigned int         h;
+
+        if (s_emFilterTime != cg.time || s_emFilterCount != m_emitters.NumObjects()) {
+            memset(s_emFilter, 0, sizeof(s_emFilter));
+            for (i = 1; i <= m_emitters.NumObjects(); i++) {
+                h = (unsigned int)(((uintptr_t)m_emitters.ObjectAt(i)->cgd.tiki >> 4) * 2654435761u) >> 19;
+                s_emFilter[h >> 3] |= (unsigned char)(1 << (h & 7));
+            }
+            s_emFilterTime  = cg.time;
+            s_emFilterCount = m_emitters.NumObjects();
+        }
+        h = (unsigned int)(((uintptr_t)tiki >> 4) * 2654435761u) >> 19;
+        if (!(s_emFilter[h >> 3] & (1 << (h & 7)))) {
+            m_spawnthing = NULL;    // what the walk below leaves behind when nothing matches
+            return;
+        }
+    }
+
     // Find the emitter associated with this model
     for (i = 1; i <= m_emitters.NumObjects(); i++) {
         m_spawnthing = m_emitters.ObjectAt(i);

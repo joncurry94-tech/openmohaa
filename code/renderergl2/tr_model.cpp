@@ -1641,6 +1641,47 @@ static uint64_t SKC_HashBones(const skelBoneCache_t *bones, int numBones)
     return h;
 }
 
+/*
+SKC_EntHash - [bug-3491] the bone + morph hash of an entity, worked out once per view instead of once per surface
+(a soldier has ten or more surfaces and they all share the one bone block). Keyed by the entity AND the address of
+its bone block: R_AddSkelSurfaces gives every view its own copy, so a hit can only be the same entity in the same
+view of the same frame.
+*/
+#define SKC_EH_SLOTS 2048
+
+typedef struct {
+    trRefEntity_t   *ent;
+    skelBoneCache_t *bones;
+    int              frame;
+    uint64_t         hash;
+} skcEntHash_t;
+
+static skcEntHash_t s_skcEh[SKC_EH_SLOTS];
+
+static uint64_t SKC_EntHash(trRefEntity_t *ent, skelBoneCache_t *bones, int numBones, const int *morphs)
+{
+    skcEntHash_t *e = &s_skcEh[(unsigned int)(((uintptr_t)ent >> 4) * 2654435761u) & (SKC_EH_SLOTS - 1)];
+    uint64_t      h;
+    int           nMorph, mi;
+
+    if (e->ent == ent && e->bones == bones && e->frame == tr.frameCount) {
+        return e->hash;
+    }
+    h      = SKC_HashBones(bones, numBones);
+    nMorph = (int)ent->e.hasMorph;
+    if (nMorph > 0) {
+        for (mi = 0; mi < nMorph; mi++) {
+            h ^= (uint64_t)(unsigned int)morphs[mi] + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        }
+        h ^= (uint64_t)nMorph << 48;
+    }
+    e->ent   = ent;
+    e->bones = bones;
+    e->frame = tr.frameCount;
+    e->hash  = h;
+    return h;
+}
+
 static skcEntry_t *SKC_Lookup(int entityNumber, skelSurfaceGame_t *sf, int rc, float scale, uint64_t h)
 {
     unsigned int idx = ((unsigned int)entityNumber * 2654435761u) ^ ((unsigned int)((uintptr_t)sf >> 4) * 40503u)
@@ -2300,7 +2341,7 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
         psJob_t            job;
         psEntry_t         *slot;
         skcEntry_t        *skc = NULL;
-        int                bytes, nMorph;
+        int                bytes;
         uint64_t           hash;
 
         if (*drawSurf->surface != SF_TIKI_SKEL) {
@@ -2326,16 +2367,8 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
         job.store    = NULL;
 
         if (r_hzmSkelCache->integer) {
-            hash   = SKC_HashBones(job.bones, ri.TIKI_GetNumChannels(job.tiki));
-            nMorph = (int)ent->e.hasMorph;
-            if (nMorph > 0) {
-                int mi;
-                for (mi = 0; mi < nMorph; mi++) {
-                    hash ^= (uint64_t)(unsigned int)job.morphs[mi] + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
-                }
-                hash ^= (uint64_t)nMorph << 48;
-            }
-            skc = SKC_Lookup(ent->e.entityNumber, sf, (int)job.rc, job.scale, hash);
+            hash = SKC_EntHash(ent, job.bones, ri.TIKI_GetNumChannels(job.tiki), job.morphs);
+            skc  = SKC_Lookup(ent->e.entityNumber, sf, (int)job.rc, job.scale, hash);
             if (skc && skc->valid) {
                 skc->hitFrame = tr.frameCount;      // its buffer is in use until this frame is drawn
                 slot->data    = skc->data;
@@ -2613,16 +2646,7 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
     }
 
     if (r_hzmSkelCache->integer && render_count >= 24) {
-        uint64_t skcHash = SKC_HashBones(bones, ri.TIKI_GetNumChannels(tiki));
-        int      skcMorphs = (int)backEnd.currentEntity->e.hasMorph;
-
-        if (skcMorphs > 0) {
-            int mi;
-            for (mi = 0; mi < skcMorphs; mi++) {
-                skcHash ^= (uint64_t)(unsigned int)morphs[mi] + 0x9E3779B97F4A7C15ULL + (skcHash << 6) + (skcHash >> 2);
-            }
-            skcHash ^= (uint64_t)skcMorphs << 48;
-        }
+        uint64_t skcHash = SKC_EntHash(backEnd.currentEntity, bones, ri.TIKI_GetNumChannels(tiki), morphs);
         skc = SKC_Lookup(backEnd.currentEntity->e.entityNumber, sf, (int)render_count, scale, skcHash);
         if (skc && skc->valid) {
             memcpy(outXyz, skc->data, render_count * sizeof(vec4_t));
