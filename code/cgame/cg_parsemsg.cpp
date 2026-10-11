@@ -43,7 +43,10 @@ typedef struct {
     qboolean bIgnoreEntities;
 } bullet_tracer_t;
 
-#define MAX_BULLET_TRACERS       32
+// HZM coop [bug-3477, tester log 2026-10-10]: 32 tracer volleys per CLIENT FRAME was hit 778 times in one minute on
+// Omaha (m3l1a) - at 19 fps a frame carries ~50 ms of beach MG fire - and every miss both dropped the tracer and
+// printed a console line (a flushed log write each). 128 volleys still fit MAX_BULLET_TRACE_BULLETS easily.
+#define MAX_BULLET_TRACERS       128
 #define MAX_BULLET_TRACE_BULLETS 1024
 #define MAX_IMPACTS              64
 static constexpr unsigned int BULLET_TRAVEL_DIST = 9216;
@@ -1088,7 +1091,12 @@ static void CG_MakeBulletTracer(
     }
 
     if (bullet_tracer_bullets_count >= MAX_BULLET_TRACERS) {
-        Com_Printf("CG_MakeBulletTracer: MAX_BULLET_TRACERS exceeded\n");
+        // HZM coop [bug-3477] one developer line per 10 s at most - this used to print on EVERY dropped volley
+        static int s_iLastTracerWarn = 0;
+        if (cg.time - s_iLastTracerWarn > 10000 || cg.time < s_iLastTracerWarn) {
+            s_iLastTracerWarn = cg.time;
+            cgi.DPrintf("CG_MakeBulletTracer: MAX_BULLET_TRACERS exceeded\n");
+        }
         return;
     }
 
