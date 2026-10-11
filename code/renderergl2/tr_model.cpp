@@ -1198,6 +1198,30 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
             && (tr.viewParms.flags & VPF_DEPTHSHADOW)) {
             return;
         }
+
+        // HZM gl2 [bug-3488] A SKELETAL MODEL OUTSIDE THE VIEW IS NOT DRAWN.
+        // As the comment above says, the cull result only ever gated the bone copy: in the main view the mesh
+        // loop below emitted every surface of every skeletal model in the PVS whether or not it was on screen
+        // (the box test, R_CullSkelModel, is stubbed to CULL_IN - "FIXME: not working properly"). The back end
+        // then skinned, uploaded and drew all of them for the GPU to clip away. Measured on Omaha that is the
+        // whole frame: the same frame time looking at the battle or at a wall (tester report 2026-10-10).
+        // The test is the sphere the function already has, enlarged well past the model (2x its radius plus
+        // 96 units) so nothing with a long animation, a held weapon or an attachment can drop out at the edge
+        // of the screen. Colour views and mirrors only (each view carries its own frustum); every shadow-map
+        // view keeps exactly the behaviour it had. First-person and depth-hack models are never culled.
+        // r_hzmSkelCull 0 = off (live).
+        {
+            static cvar_t *r_hzmSkelCull = NULL;
+            if (!r_hzmSkelCull) {
+                r_hzmSkelCull = ri.Cvar_Get("r_hzmSkelCull", "1", 0);
+            }
+            if (iRadiusCull == CULL_OUT && r_hzmSkelCull->integer
+                && !(tr.viewParms.flags & (VPF_SHADOWMAP | VPF_DEPTHSHADOW | VPF_PSHADOW | VPF_SUNWORLD | VPF_SUNSTABLE))
+                && !(ent->e.renderfx & (RF_FIRST_PERSON | RF_DEPTHHACK))
+                && R_CullPointAndRadius(tiki_worldorigin, radius * 2.0f + 96.0f) == CULL_OUT) {
+                return;
+            }
+        }
     }
 
     if (tiki->a->bIsCharacter) {

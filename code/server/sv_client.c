@@ -1540,6 +1540,8 @@ Pull specific info from a newly changed userinfo string
 into a more C friendly form.
 =================
 */
+static cvar_t *sv_hzmClientRate = NULL;	// HZM coop [bug-3489]
+
 void SV_UserinfoChanged( client_t *cl ) {
 	char	*val;
 	char	*ip;
@@ -1569,7 +1571,21 @@ void SV_UserinfoChanged( client_t *cl ) {
 
 	// if the client is on the same subnet as the server and we aren't running an
 	// internet public server, assume they don't need a rate choke
-	if ( Sys_IsLANAddress( cl->netchan.remoteAddress ) && com_dedicated->integer != 2 && sv_lanForceRate->integer == 1) {
+	// HZM coop [bug-3489, user 2026-10-11: "all players should be playing with the highest possible internet speed
+	// settings, and ... that shouldn't be changeable for anyone"]. The client's own `rate` (a 2002 modem setting:
+	// engine default 25000, hard cap 90000 below, 3000 when the key is missing) decided how many bytes a second the
+	// server may send it, and SV_RateMsec delays snapshots to stay under it. A crowded coop map needs several
+	// times that for 40 snapshots a second, so an internet joiner on Omaha was getting a fraction of the updates
+	// the host sends - choppy soldiers at any frame rate. The HOST decides now: every client gets
+	// sv_hzmClientRate bytes a second (default 10,000,000 = no practical limit) whatever its own setting says.
+	// 0 = the old behaviour (the client's rate, capped at 90000). sv_maxRate still caps everyone when a host on a
+	// thin uplink sets it.
+	if ( !sv_hzmClientRate ) {
+		sv_hzmClientRate = Cvar_Get( "sv_hzmClientRate", "10000000", CVAR_ARCHIVE );
+	}
+	if ( sv_hzmClientRate->integer > 0 ) {
+		cl->rate = sv_hzmClientRate->integer;
+	} else if ( Sys_IsLANAddress( cl->netchan.remoteAddress ) && com_dedicated->integer != 2 && sv_lanForceRate->integer == 1) {
 		cl->rate = 99999;	// lans should not rate limit
 	} else {
 		val = Info_ValueForKey (cl->userinfo, "rate");
@@ -1596,7 +1612,13 @@ void SV_UserinfoChanged( client_t *cl ) {
 	// snaps command
 	val = Info_ValueForKey (cl->userinfo, "snaps");
 
-	if(strlen(val))
+	// HZM coop [bug-3489] same rule: every client gets every server frame (engine default snaps is 20, half of the
+	// 40 the mod runs at, for anyone whose config never had the mod's value written into it)
+	if ( sv_hzmClientRate->integer > 0 )
+	{
+		i = 1000 / ( sv_fps->integer > 0 ? sv_fps->integer : 20 );
+	}
+	else if(strlen(val))
 	{
 		i = atoi(val);
 		
