@@ -120,11 +120,11 @@ static qboolean CG_RainBrushDropVisible(const vec3_t vStart, vec3_t vEnd, int *p
     VectorCopy(vStart, vSkyEnd);
     vSkyEnd[2] += 16384.0f;
     cgi.CM_BoxTrace(&tr, vStart, vSkyEnd, vZero, vZero, 0, MASK_SOLID, qfalse);
-    if (pStrict->integer) {
-        if (!(tr.surfaceFlags & SURF_SKY)) {
-            return qfalse;
-        }
-    } else if (!(tr.surfaceFlags & SURF_SKY) && tr.fraction < 0.999f) {
+    // Here the mapper already said "it rains in this box", so a drop is refused only on positive evidence of a
+    // roof: the column above it hits a solid that is NOT sky. Open void above (nothing hit) still rains - the
+    // strict "must land on a sky surface" rule (coop_rainSkyStrict) is for the brushless path, which has no box.
+    (void)pStrict;
+    if (!(tr.surfaceFlags & SURF_SKY) && tr.fraction < 0.999f) {
         return qfalse;
     }
 

@@ -137,6 +137,7 @@ typedef struct goreInstance_s {
     image_t *instImage;     // reusable "*goreN" image slot (r_sequence -1)
     byte    *pixels;        // CPU RGBA working copy (ri.Malloc)
     int      width, height; // dimensions of pixels / instImage upload
+    int      fullWidth;     // [bug-3493] width of the base image itself; width may be a smaller mip of it
     int      lastUseFrame;  // LRU (tr.frameCount at last bind/stamp)
     // bug-754: skin-flip migration
     char           family[MAX_QPATH];         // baseImage name minus extension + _bloodN suffix
@@ -232,12 +233,52 @@ creation / tier-skin rebase, so the full rebind cost afterwards is
 irrelevant.
 ================
 */
-static void R_GoreReadTexImage(image_t *img, byte *out)
+static void R_GoreReadTexImage(image_t *img, int level, byte *out)
 {
     qglActiveTexture(GL_TEXTURE0);
     qglBindTexture(GL_TEXTURE_2D, img->texnum);
-    qglGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    qglGetTexImage(GL_TEXTURE_2D, level, GL_RGBA, GL_UNSIGNED_BYTE, out);
     GL_BindNullTextures();
+}
+
+/*
+================
+R_GoreInstanceDims
+
+HZM coop [bug-3493, part 2] the size a wound instance of `img` is built at, and the mip level it is read from.
+After the base-pixel cache EVERY first wound was still a slow frame, cache hit or not: the readback scales with the
+pixels (measured 31 ms for 2048x2048, 7 ms for 1024x1024) and so does everything after it - a 16 MB allocation, a
+16 MB copy and a 16 MB upload for each wounded body part of an HD skin. The cost is the size, so the instance is
+made from the first mip level that fits r_goreMaxSize: a quarter of the bytes per step down. DEFAULT 4096 = NO
+reduction - the user's decision (2026-10-11: "keep the full gore and do the full fix"); 1024 is the measured
+quick fix (readbacks 3-9 ms instead of ~31) and stays available as a switch until the GPU compositor lands. The
+stamp clamps scale with it (R_GoreStampPixels), so a wound covers the same part of the body as before.
+Images without mipmaps are never reduced.
+================
+*/
+static void R_GoreInstanceDims(const image_t *img, int *w, int *h, int *level)
+{
+    static cvar_t *maxSize = NULL;
+    int            lim;
+
+    if (!maxSize) {
+        maxSize = ri.Cvar_Get("r_goreMaxSize", "4096", CVAR_ARCHIVE);
+    }
+    lim = maxSize->integer;
+    if (lim < 64) {
+        lim = 64;
+    }
+    *w     = img->uploadWidth;
+    *h     = img->uploadHeight;
+    *level = 0;
+    if (!(img->flags & IMGFLAG_MIPMAP)) {
+        return;
+    }
+    while ((*w > lim || *h > lim) && *w >= 16 && *h >= 16) {
+        *w >>= 1;
+        *h >>= 1;
+        (*level)++;
+    }
 }
 
 /*
@@ -280,7 +321,7 @@ static void R_GoreBaseFree(goreBase_t *b)
     Com_Memset(b, 0, sizeof(*b));
 }
 
-static void R_GoreBasePixels(image_t *img, int w, int h, byte *out)
+static void R_GoreBasePixels(image_t *img, int level, int w, int h, byte *out)
 {
     static cvar_t *capMB = NULL;
     size_t         need  = (size_t)w * h * 4, cap;
@@ -304,11 +345,16 @@ static void R_GoreBasePixels(image_t *img, int w, int h, byte *out)
         }
     }
 
-    R_GoreReadTexImage(img, out);
-    s_goreBaseReads++;
-    if (r_goreDebug && r_goreDebug->integer) {
-        ri.Printf(PRINT_ALL, "^~^~^ GORE base readback %s %dx%d (readbacks %d, cache hits %d, cache %d MB)\n", img->imgName,
-                  w, h, s_goreBaseReads, s_goreBaseHits, (int)(s_goreBaseBytes >> 20));
+    {
+        int t0 = ri.Milliseconds();
+
+        R_GoreReadTexImage(img, level, out);
+        s_goreBaseReads++;
+        if (r_goreDebug && r_goreDebug->integer) {
+            ri.Printf(PRINT_ALL, "^~^~^ GORE base readback %s %dx%d (mip %d) took %d ms (readbacks %d, cache hits %d, cache %d MB)\n",
+                      img->imgName, w, h, level, ri.Milliseconds() - t0, s_goreBaseReads, s_goreBaseHits,
+                      (int)(s_goreBaseBytes >> 20));
+        }
     }
     if (!cap || need > cap) {
         return;
@@ -1248,7 +1294,7 @@ static void R_GoreRebaseInstance(goreInstance_t *inst); // bug-754: defined belo
 static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImage)
 {
     goreInstance_t *inst = NULL;
-    int             i, w, h;
+    int             i, w, h, level;
 
     // existing?
     for (i = 0; i < GORE_MAX_INSTANCES; i++) {
@@ -1287,8 +1333,7 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
     if (!qglGetTexImage) {
         return NULL; // loader could not resolve the readback entry point
     }
-    w = baseImage->uploadWidth;
-    h = baseImage->uploadHeight;
+    R_GoreInstanceDims(baseImage, &w, &h, &level); // [bug-3493] a mip of an HD skin, not all 16 MB of it
     if (w < 8 || h < 8 || w * h * 4 > GORE_MAX_TEXBYTES) {
         return NULL;
     }
@@ -1357,7 +1402,7 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
 
     // read the uploaded base texture back (post-picmip, post-lightscale ->
     // the copy is pixel-identical to what everyone else renders)
-    R_GoreBasePixels(baseImage, w, h, inst->pixels); // [bug-3493] cached per uniform texture
+    R_GoreBasePixels(baseImage, level, w, h, inst->pixels); // [bug-3493] cached per uniform texture
 
     // respecify our instance slot with the copy (gl2 RE_UploadCinematic pattern:
     // the DSA-wrapped texture entry points keep the tr_dsa binding cache coherent)
@@ -1383,6 +1428,7 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
     R_GoreImageFamily(baseImage->imgName, inst->family, sizeof(inst->family)); // bug-754
     inst->width        = w;
     inst->height       = h;
+    inst->fullWidth    = baseImage->uploadWidth;
     inst->lastUseFrame = tr.frameCount;
     s_goreActiveCount++;
     if (entityNumber >= 0 && entityNumber < GORE_MAX_ENTNUM) {
@@ -1492,6 +1538,17 @@ static void R_GoreStampPixels(goreInstance_t *inst, const goreStampRec_t *st, in
         float sk  = R_GoreSkinScale();
         holeMax   = (int)(GORE_STAMP_MAXPX * sk);
         splashMax = (int)(GORE_SPLASH_MAXPX * sk);
+    }
+    // [bug-3493] the clamps are in texels of the FULL image; this instance may be a smaller mip of it
+    if (inst->fullWidth > w && inst->fullWidth > 0) {
+        holeMax   = (int)((float)holeMax * w / inst->fullWidth);
+        splashMax = (int)((float)splashMax * w / inst->fullWidth);
+        if (holeMax < 6) {
+            holeMax = 6;
+        }
+        if (splashMax < 6) {
+            splashMax = 6;
+        }
     }
     holeSize = rawSize;
     if (holeSize > holeMax) {
@@ -1681,15 +1738,17 @@ current (called from R_GoreCommitPending / R_GoreAcquireInstance).
 static void R_GoreRebaseInstance(goreInstance_t *inst)
 {
     image_t *newImg = inst->rebaseImage;
-    int      w, h, i, py, half;
+    int      w, h, i, py, half, level = 0;
 
     inst->rebaseImage = NULL;
     if (!newImg || newImg == inst->baseImage) {
         return;
     }
 
-    w = newImg->uploadWidth;
-    h = newImg->uploadHeight;
+    w = h = 0;
+    if (newImg->texnum) {
+        R_GoreInstanceDims(newImg, &w, &h, &level); // [bug-3493]
+    }
     if (!qglGetTexImage || newImg->texnum == 0 || w < 8 || h < 8 || w * h * 4 > GORE_MAX_TEXBYTES) {
         R_GoreFreeInstance(inst);
         R_GoreRebuildEntityFlags();
@@ -1703,7 +1762,8 @@ static void R_GoreRebaseInstance(goreInstance_t *inst)
         inst->height = h;
     }
 
-    R_GoreBasePixels(newImg, w, h, inst->pixels); // [bug-3493]
+    R_GoreBasePixels(newImg, level, w, h, inst->pixels); // [bug-3493]
+    inst->fullWidth = newImg->uploadWidth;
 
     for (i = 0; i < inst->numStamps; i++) {
         R_GoreStampPixels(inst, &inst->stamps[i], &py, &half);
