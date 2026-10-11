@@ -348,6 +348,7 @@ extern	game_export_t	*ge;				// game exports
 extern	cvar_t	*sv_fps;
 extern	cvar_t	*sv_lagProbe;	// HZM [user 2026-08-10]: server frame-overrun probe
 extern	cvar_t	*sv_timeout;
+extern	cvar_t	*sv_cmdPark;
 extern	cvar_t	*sv_zombietime;
 extern	cvar_t	*sv_rconPassword;
 extern	cvar_t	*sv_privatePassword;
@@ -535,6 +536,8 @@ void SV_Heartbeat_f( void );
 //
 void SV_InitRadar();
 void SV_AddServerCommand( client_t *client, const char *cmd );
+void SV_ParkClear( client_t *client );		// HZM coop [bug-3480]
+void SV_ParkDrain( client_t *client );
 void SV_UpdateServerCommandsToClient( client_t *client, msg_t *msg );
 void SV_WriteFrameToClient (client_t *client, msg_t *msg);
 void SV_SendMessageToClient( msg_t *msg, client_t *client );

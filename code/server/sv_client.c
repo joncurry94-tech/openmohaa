@@ -590,6 +590,7 @@ gotnewcl:
 	// build a new connection
 	// accept the new client
 	// this is the only place a client_t is ever initialized
+	SV_ParkClear( newcl );		// HZM coop [bug-3480] nothing parked for whoever had this slot survives
 	*newcl = temp;
 	clientNum = newcl - svs.clients;
 	ent = SV_GentityNum( clientNum );
@@ -693,6 +694,7 @@ void SV_FreeClient(client_t *client)
 
 	SV_Netchan_FreeQueue(client);
 	SV_CloseDownload(client);
+	SV_ParkClear(client);		// HZM coop [bug-3480]
 }
 
 /*
@@ -818,6 +820,11 @@ static void SV_SendClientGameState( client_t *client ) {
 	// NOTE, MRE: all server->client messages now acknowledge
 	// let the client know which reliable clientCommands we have received
 	MSG_WriteLong( &msg, client->lastClientCommand );
+
+	// HZM coop [bug-3480] anything still parked predates this gamestate. Commands queued before a
+	// gamestate are never executed by cgame (it starts from the sequence written below), so parked ones
+	// must not trickle in after it either.
+	SV_ParkClear( client );
 
 	// send any server commands waiting to be sent first.
 	// we have to do this cause we send the client->reliableSequence
@@ -2115,6 +2122,9 @@ void SV_ExecuteClientMessage( client_t *cl, msg_t *msg ) {
 		cl->reliableAcknowledge = cl->reliableSequence;
 		return;
 	}
+	// HZM coop [bug-3480] room in the in-flight window: feed it from the park
+	SV_ParkDrain( cl );
+
 	// if this is a usercmd from a previous gamestate,
 	// ignore it or retransmit the current gamestate
 	// 

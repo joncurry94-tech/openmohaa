@@ -39,6 +39,7 @@ cvar_t	*sv_fps;				// time rate for running non-clients
 cvar_t	*sv_lagProbe;			// HZM [user 2026-08-10]: 1 = report server frame overruns, which are
 								// what light the blinking "slow server" icon on every client
 cvar_t	*sv_timeout;			// seconds without any message
+cvar_t	*sv_cmdPark;			// HZM coop [bug-3480] 1 = park server commands for a client that is behind (default)
 cvar_t	*sv_zombietime;			// seconds to sink messages after disconnect
 cvar_t	*sv_rconPassword;		// password for remote server commands
 cvar_t	*sv_privatePassword;	// password for the privateClient slots
@@ -154,6 +155,118 @@ int SV_ReplacePendingServerCommands( client_t *client, const char *cmd ) {
 
 /*
 ======================
+HZM coop [bug-3480] THE PARK
+
+Tester report 2026-10-10: a teammate was dropped with "Server command overflow" while a 40 second map load was in
+progress. A loading client acknowledges nothing, the ring holds MAX_RELIABLE_COMMANDS (1024), and a busy coop map
+sends a loading client far more than that - so it was kicked for being slow, by a queue that was only ever meant to
+catch a dead connection.
+
+Nothing is dropped and nothing is reordered now. At most SV_PARK_WINDOW commands are in flight (unacknowledged) at
+once; anything beyond that waits in a per-client FIFO and is fed into the ring as acknowledgements arrive. Once
+anything is parked, everything later is parked behind it, so the client sees exactly the sequence it would have
+seen. The window is deliberately well under the ring: the CLIENT keeps its own 1024-slot ring and errors out if a
+command it has received is overwritten before cgame executed it, and a client that has just finished loading
+acknowledges a little before it starts executing.
+
+A client that is genuinely gone still ends the old way - by timing out, or when the park itself reaches
+SV_PARK_MAX.
+======================
+*/
+#define SV_PARK_WINDOW	256
+#define SV_PARK_MAX		32768
+
+typedef struct svParkNode_s {
+	struct svParkNode_s	*next;
+	char				cmd[1];
+} svParkNode_t;
+
+typedef struct {
+	svParkNode_t	*head, *tail;
+	int				count;
+	int				peak;
+	int				reported;	// next count at which to print a line
+} svPark_t;
+
+static svPark_t sv_park[MAX_CLIENTS];
+
+static svPark_t *SV_ParkFor( client_t *client ) {
+	int n = (int)( client - svs.clients );
+	if ( !svs.clients || n < 0 || n >= MAX_CLIENTS ) {
+		return NULL;
+	}
+	return &sv_park[n];
+}
+
+/*
+======================
+SV_ParkClear
+
+The client is gone, is being replaced, or is about to be sent a gamestate (which makes everything queued before it
+obsolete - cgame starts from the gamestate's command sequence).
+======================
+*/
+void SV_ParkClear( client_t *client ) {
+	svPark_t		*pk = SV_ParkFor( client );
+	svParkNode_t	*n, *next;
+
+	if ( !pk ) {
+		return;
+	}
+	if ( pk->peak >= 256 ) {
+		Com_Printf( "^~^~^ SVCMDPARK client=%d cleared with %d parked (peak %d)\n", (int)( client - svs.clients ),
+			pk->count, pk->peak );
+	}
+	for ( n = pk->head ; n ; n = next ) {
+		next = n->next;
+		Z_Free( n );
+	}
+	Com_Memset( pk, 0, sizeof( *pk ) );
+}
+
+/*
+======================
+SV_ParkDrain
+
+Called when the client has acknowledged something: move parked commands into the ring, oldest first, while the
+in-flight window has room.
+======================
+*/
+void SV_ParkDrain( client_t *client ) {
+	svPark_t		*pk = SV_ParkFor( client );
+	svParkNode_t	*n;
+	int				index, fed = 0;
+
+	if ( !pk || !pk->head ) {
+		return;
+	}
+	if ( client->state < CS_PRIMED ) {
+		return;
+	}
+	while ( pk->head && client->reliableSequence - client->reliableAcknowledge < SV_PARK_WINDOW ) {
+		n = pk->head;
+		pk->head = n->next;
+		if ( !pk->head ) {
+			pk->tail = NULL;
+		}
+		pk->count--;
+		client->reliableSequence++;
+		index = client->reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 );
+		Q_strncpyz( client->reliableCommands[ index ], n->cmd, sizeof( client->reliableCommands[ index ] ) );
+		Z_Free( n );
+		fed++;
+	}
+	if ( !pk->head && fed ) {
+		if ( pk->peak >= 256 ) {
+			Com_Printf( "^~^~^ SVCMDPARK client=%d caught up (peak %d parked)\n", (int)( client - svs.clients ), pk->peak );
+		}
+		pk->peak = 0;
+		pk->reported = 0;
+	}
+}
+
+/*
+======================
 SV_CmdQueueReport
 
 HZM coop [bug-3480, tester report 2026-10-10: "<player> Server command overflow"]
@@ -169,9 +282,18 @@ static void SV_CmdQueueReport( client_t *client, int pending ) {
 	const char	*c;
 	char		tok[28];
 	char		line[640];
+	svPark_t	*pk = SV_ParkFor( client );
+	svParkNode_t *pn = pk ? pk->head : NULL;
+	int			ringEnd = client->reliableSequence;
 
-	for ( i = client->reliableAcknowledge + 1 ; i <= client->reliableSequence ; i++ ) {
-		c = client->reliableCommands[ i & (MAX_RELIABLE_COMMANDS-1) ];
+	// the ring first, then whatever is parked behind it
+	for ( i = client->reliableAcknowledge + 1 ; i <= ringEnd || pn ; i++ ) {
+		if ( i <= ringEnd ) {
+			c = client->reliableCommands[ i & (MAX_RELIABLE_COMMANDS-1) ];
+		} else {
+			c = pn->cmd;
+			pn = pn->next;
+		}
 		len = 0;
 		while ( c[len] && c[len] != ' ' && len < 12 ) {
 			tok[len] = c[len];
@@ -209,8 +331,9 @@ static void SV_CmdQueueReport( client_t *client, int pending ) {
 	for ( k = 0 ; k < n ; k++ ) {
 		Q_strcat( line, sizeof( line ), va( " %s=%d", names[k], counts[k] ) );
 	}
-	Com_Printf( "^~^~^ SVCMDQ client=%d state=%d pending=%d of %d:%s other=%d\n", (int)( client - svs.clients ),
-		(int)client->state, pending, MAX_RELIABLE_COMMANDS, line, other );
+	Com_Printf( "^~^~^ SVCMDQ client=%d state=%d waiting=%d (in flight %d, parked %d):%s other=%d\n",
+		(int)( client - svs.clients ), (int)client->state, pending,
+		client->reliableSequence - client->reliableAcknowledge, pk ? pk->count : 0, line, other );
 }
 
 /*
@@ -223,6 +346,7 @@ not have future snapshot_t executed before it is executed
 */
 void SV_AddServerCommand( client_t *client, const char *cmd ) {
 	int		index, i;
+	svPark_t	*pk;
 
 	if ( com_protocol->integer >= PROTOCOL_MOHTA_MIN ) {
 		// Added in 2.0
@@ -249,6 +373,45 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 	if( client->state < CS_PRIMED )
 		return;
 
+	// HZM coop [bug-3480] the in-flight window is full, or something is already waiting: park it (see THE PARK)
+	pk = SV_ParkFor( client );
+	// sv_cmdPark 0 is the kill switch: the stock behaviour, overflow drop and all (anything already parked still
+	// goes out first, in order)
+	if ( pk && client->gamestateMessageNum != -1
+		&& ( pk->head || ( sv_cmdPark->integer
+			&& client->reliableSequence - client->reliableAcknowledge >= SV_PARK_WINDOW ) ) ) {
+		svParkNode_t	*n;
+		int				len = (int)strlen( cmd );
+
+		if ( pk->count >= SV_PARK_MAX ) {
+			Com_Printf( "^~^~^ SVCMDPARK client=%d park full (%d) - dropping\n", (int)( client - svs.clients ), pk->count );
+			SV_CmdQueueReport( client, pk->count + client->reliableSequence - client->reliableAcknowledge );
+			SV_DropClient( client, "Server command overflow" );
+			return;
+		}
+		n = (svParkNode_t *)Z_Malloc( sizeof( *n ) + len );
+		n->next = NULL;
+		Com_Memcpy( n->cmd, cmd, len + 1 );
+		if ( pk->tail ) {
+			pk->tail->next = n;
+		} else {
+			pk->head = n;
+		}
+		pk->tail = n;
+		pk->count++;
+		if ( pk->count > pk->peak ) {
+			pk->peak = pk->count;
+		}
+		if ( pk->reported == 0 ) {
+			pk->reported = 256;
+		}
+		if ( pk->count >= pk->reported ) {
+			SV_CmdQueueReport( client, pk->count + client->reliableSequence - client->reliableAcknowledge );
+			pk->reported *= 2;
+		}
+		return;
+	}
+
 	client->reliableSequence++;
 	// if we would be losing an old command that hasn't been acknowledged,
 	// we must drop the connection
@@ -272,9 +435,9 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 	index = client->reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 );
 	Q_strncpyz( client->reliableCommands[ index ], cmd, sizeof( client->reliableCommands[ index ] ) );
 
-	// HZM coop [bug-3480] say what the queue holds as it fills (see SV_CmdQueueReport)
+	// HZM coop [bug-3480] with the park switched off, say what the ring holds as it fills
 	i = client->reliableSequence - client->reliableAcknowledge;
-	if ( i == 256 || i == 512 || i == 768 || i == 1000 ) {
+	if ( !sv_cmdPark->integer && ( i == 256 || i == 512 || i == 768 || i == 1000 ) ) {
 		SV_CmdQueueReport( client, i );
 	}
 }
