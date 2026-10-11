@@ -4227,7 +4227,7 @@ void CL_Init( void ) {
 	cl_pitchspeed = Cvar_Get ("cl_pitchspeed", "140", CVAR_ARCHIVE);
 	cl_anglespeedkey = Cvar_Get ("cl_anglespeedkey", "1.5", 0);
 
-	cl_maxpackets = Cvar_Get ("cl_maxpackets", "30", CVAR_ARCHIVE );
+	cl_maxpackets = Cvar_Get ("cl_maxpackets", "100", CVAR_ARCHIVE );	// HZM coop [bug-3489] was 30: best connection for everyone
 	cl_packetdup = Cvar_Get ("cl_packetdup", "1", CVAR_ARCHIVE );
 
 	cl_run = Cvar_Get( "cl_run", "1", CVAR_ARCHIVE );
@@ -4418,8 +4418,8 @@ void CL_Init( void ) {
 
 	// userinfo
 	name = Cvar_Get ("name", va("UnnamedSoldier#%d", rand() % 100000), CVAR_USERINFO | CVAR_ARCHIVE);
-	cl_rate = Cvar_Get ("rate", "25000", CVAR_USERINFO | CVAR_ARCHIVE );
-	Cvar_Get ("snaps", "20", CVAR_USERINFO | CVAR_ARCHIVE );
+	cl_rate = Cvar_Get ("rate", "90000", CVAR_USERINFO | CVAR_ARCHIVE );	// HZM coop [bug-3489] was 25000 (and CL_ApplyOriginalConfigTweaks resets to these)
+	Cvar_Get ("snaps", "40", CVAR_USERINFO | CVAR_ARCHIVE );	// HZM coop [bug-3489] was 20: the mod runs sv_fps 40
 	Cvar_Get ("password", "", CVAR_USERINFO);
 	Cvar_Get ("dm_playermodel", "american_army", CVAR_USERINFO | CVAR_ARCHIVE );
 	Cvar_Get ("dm_playergermanmodel", "german_wehrmacht_soldier", CVAR_USERINFO | CVAR_ARCHIVE );
