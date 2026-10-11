@@ -2825,6 +2825,13 @@ void CL_Frame ( int msec ) {
 		return;
 	}
 
+	/* HZM coop [bug-3484]: the recommended graphics preset for this PC (cl_hzm_recommend.cpp). Returns at once
+	   except once a second, and does real work only when the video-memory reading changes. */
+	{
+		void CL_HzmRecommend_Update(void);
+		CL_HzmRecommend_Update();
+	}
+
 	/* HZM coop: mirror "actually playing" into ui_ingame so menus can gate widgets with
 	   enabledcvar "ui_ingame" (e.g. the multiplayer room's DISCONNECT FROM GAME button,
 	   which vanilla draws even at the pre-game menu). Works for hosts and joining clients
