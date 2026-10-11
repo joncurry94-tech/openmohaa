@@ -4638,6 +4638,9 @@ typedef void (APIENTRY *hzmBindFragDataLocation_t)(GLuint program, GLuint color,
 typedef void (APIENTRY *hzmDrawElementsBaseVertex_t)(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex);
 extern hzmDrawElementsBaseVertex_t qglDrawElementsBaseVertex;
 qboolean R_TessStreamDraw(int numIndexes, int firstIndex);
+// HZM gl2 [bug-3487] skinning on worker threads (tr_model.cpp)
+void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs);
+void R_SkelThreadsShutdown(void);
 extern hzmDrawBuffers_t          qglDrawBuffers;            // GL 2.0; NULL = no MRT colour resolve (blit fallback)
 extern hzmBindFragDataLocation_t qglBindFragDataLocation;   // GL 3.0; NULL = no MRT colour resolve (blit fallback)
 qboolean    R_MsaaResolvesActive(void);

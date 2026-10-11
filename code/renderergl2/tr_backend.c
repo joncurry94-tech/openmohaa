@@ -820,6 +820,12 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 	// the entry guard so nothing between two lists - 2D, sky, post - can observe a stale flag.
 	backEnd.charLight.active = qfalse;
 
+	// HZM gl2 [bug-3487] skin this list's skeletal surfaces on worker threads before the loop needs them
+	// (tr_model.cpp R_SkelPreskin). Colour passes only: a depth-only pass skips most characters.
+	if ( !backEnd.depthFill ) {
+		R_SkelPreskin( drawSurfs, numDrawSurfs );
+	}
+
 	for (i = 0, drawSurf = drawSurfs ; i < numDrawSurfs ; i++, drawSurf++) {
 		if ( drawSurf->sort == oldSort && drawSurf->cubemapIndex == oldCubemapIndex) {
 			// see RB_DepthFillSkip: bug-gl2-foliage-white + bug-gl2-invisible-live-char-depthprepass

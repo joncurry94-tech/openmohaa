@@ -2487,6 +2487,9 @@ RE_Shutdown
 */
 void RE_Shutdown( qboolean destroyWindow ) {	
 
+	// HZM gl2 [bug-3487] the skinning workers live in this DLL, and it is unloaded on every vid_restart
+	R_SkelThreadsShutdown();
+
 	ri.Printf( PRINT_ALL, "RE_Shutdown( %i )\n", destroyWindow );
 
 	// HZM bug-3011/bug-3102: cvars outlive the renderer DLL. Withdraw the gl2 -> cgame handshake

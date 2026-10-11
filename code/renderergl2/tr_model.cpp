@@ -1571,6 +1571,7 @@ typedef struct {
     uint64_t           boneHash;
     int                lastFrame;
     int                same;        // consecutive sightings with this hash
+    int                hitFrame;    // last frame its buffer was handed to the frame table (bug-3487)
     qboolean           valid;       // data holds the skin for boneHash
     int                bytes;
     byte              *data;        // xyz[rc] | normal[rc] | texCoords[rc]
@@ -1643,6 +1644,10 @@ static skcEntry_t *SKC_Lookup(int entityNumber, skelSurfaceGame_t *sf, int rc, f
         }
     }
 
+    if (victim->hitFrame == tr.frameCount && victim->data) {
+        // [bug-3487] every candidate here is holding a buffer the frame table points at: no caching for this one
+        return NULL;
+    }
     if (victim->data) {
         free(victim->data);
         s_skcBytes -= victim->bytes;
@@ -1657,9 +1662,29 @@ static skcEntry_t *SKC_Lookup(int entityNumber, skelSurfaceGame_t *sf, int rc, f
     return victim;
 }
 
+static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc);
+
 static void SKC_Store(skcEntry_t *e, int baseVertex, int rc)
 {
+    // tess keeps the three arrays apart; gather them and store
+    static byte tmp[SHADER_MAX_VERTEXES * SKC_VERT_BYTES];
+
+    if (rc > SHADER_MAX_VERTEXES) {
+        return;
+    }
+    memcpy(tmp, tess.xyz[baseVertex], rc * sizeof(vec4_t));
+    memcpy(tmp + rc * sizeof(vec4_t), tess.normal[baseVertex], rc * 4 * sizeof(int16_t));
+    memcpy(tmp + rc * (sizeof(vec4_t) + 4 * sizeof(int16_t)), tess.texCoords[baseVertex], rc * sizeof(vec2_t));
+    SKC_StoreFrom(e, tmp, rc);
+}
+
+static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
+{
     int bytes = rc * (int)SKC_VERT_BYTES;
+
+    if (e->hitFrame == tr.frameCount) {
+        return;     // [bug-3487] its buffer is on loan to the frame table until this frame is drawn
+    }
 
     if (!e->data) {
         if (s_skcBytes + bytes > SKC_MAX_BYTES) {
@@ -1685,11 +1710,664 @@ static void SKC_Store(skcEntry_t *e, int baseVertex, int rc)
         e->bytes = bytes;
         s_skcBytes += bytes;
     }
-    memcpy(e->data, tess.xyz[baseVertex], rc * sizeof(vec4_t));
-    memcpy(e->data + rc * sizeof(vec4_t), tess.normal[baseVertex], rc * 4 * sizeof(int16_t));
-    memcpy(e->data + rc * (sizeof(vec4_t) + 4 * sizeof(int16_t)), tess.texCoords[baseVertex], rc * sizeof(vec2_t));
+    memcpy(e->data, src, bytes);
     e->valid = qtrue;
     s_skcStore++;
+}
+
+/*
+=============
+SKEL_Skin
+
+HZM gl2 [bug-3487] The four skinning loops of RB_SkelMesh (morph / no morph x base mesh / attached mesh), lifted out
+unchanged so a worker thread can run them: this function touches nothing but its arguments, the model data and the
+bone / morph pools it is handed, all of which are read-only while the back end is drawing.
+=============
+*/
+static void SKEL_Skin(skelSurfaceGame_t *sf, dtiki_t *tiki, skelHeaderGame_t *skelmodel, int mesh,
+                      unsigned int render_count, float scale, skelBoneCache_t *bones, int *morphs, qboolean hasMorph,
+                      float *outXyz, int16_t *outNormal, float *outTc)
+{
+    skeletorVertex_t *newVerts = sf->pVerts;
+    skeletorMorph_t  *morph;
+    skelWeight_t     *weight;
+    skelBoneCache_t  *bone;
+    int              *morphcache;
+    int               vertNum;
+    int               morphNum;
+    int               weightNum;
+
+    if (hasMorph) {
+        if (mesh > 0) {
+            for (vertNum = 0; vertNum < render_count; vertNum++) {
+                vec3_t normal;
+                vec3_t out;
+                vec3_t totalmorph;
+                int    channelNum;
+                int    boneNum;
+
+                VectorClear(out);
+                VectorClear(outXyz);
+                VectorClear(totalmorph);
+
+                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
+                morph  = (skeletorMorph_t *)((byte *)newVerts + sizeof(skeletorVertex_t));
+
+                for (morphNum = 0; morphNum < newVerts->numMorphs; morphNum++) {
+                    morphcache = &morphs[morph->morphIndex];
+
+                    if (*morphcache) {
+                        SkelMorphGetXyz(morph, morphcache, totalmorph);
+                    }
+
+                    morph++;
+                }
+
+                if (newVerts->numMorphs) {
+                    channelNum = skelmodel->pBones[morph->morphIndex].channel;
+                } else {
+                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
+                }
+
+                boneNum = ri.TIKI_GetLocalChannel(tiki, channelNum);
+                bone    = &bones[boneNum];
+
+                SkelVertGetNormal(newVerts, bone, normal);
+
+                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
+                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
+                    boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
+                    bone       = &bones[boneNum];
+
+                    if (!weightNum) {
+                        SkelWeightMorphGetXyz(weight, bone, totalmorph, out);
+                    } else {
+                        SkelWeightGetXyz(weight, bone, out);
+                    }
+
+                    weight++;
+                }
+
+                R_VaoPackNormal(outNormal, normal);
+                VectorScale(out, scale, outXyz);
+
+                outTc[vertNum * 2] = newVerts->texCoords[0];
+                outTc[vertNum * 2 + 1] = newVerts->texCoords[1];
+                // FIXME: fill in lightmapST for completeness?
+
+                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
+                                                + sizeof(skelWeight_t) * newVerts->numWeights);
+                outXyz += 4;
+                outNormal += 4;
+            }
+        } else {
+            for (vertNum = 0; vertNum < render_count; vertNum++) {
+                vec3_t normal;
+                vec3_t out;
+                vec3_t totalmorph;
+
+                VectorClear(out);
+                VectorClear(outXyz);
+                VectorClear(totalmorph);
+
+                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
+                morph  = (skeletorMorph_t *)((byte *)newVerts + sizeof(skeletorVertex_t));
+
+                for (morphNum = 0; morphNum < newVerts->numMorphs; morphNum++) {
+                    morphcache = &morphs[morph->morphIndex];
+
+                    if (*morphcache) {
+                        SkelMorphGetXyz(morph, morphcache, totalmorph);
+                    }
+
+                    morph++;
+                }
+
+                if (newVerts->numMorphs) {
+                    bone = &bones[morph->morphIndex];
+                } else {
+                    bone = &bones[weight->boneIndex];
+                }
+
+                SkelVertGetNormal(newVerts, bone, normal);
+
+                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
+                    bone = &bones[weight->boneIndex];
+
+                    if (!weightNum) {
+                        SkelWeightMorphGetXyz(weight, bone, totalmorph, out);
+                    } else {
+                        SkelWeightGetXyz(weight, bone, out);
+                    }
+
+                    weight++;
+                }
+
+                R_VaoPackNormal(outNormal, normal);
+                VectorScale(out, scale, outXyz);
+
+                outTc[vertNum * 2] = newVerts->texCoords[0];
+                outTc[vertNum * 2 + 1] = newVerts->texCoords[1];
+                // FIXME: fill in lightmapST for completeness?
+
+                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
+                                                + sizeof(skelWeight_t) * newVerts->numWeights);
+                outXyz += 4;
+                outNormal += 4;
+            }
+        }
+    } else {
+        if (mesh > 0) {
+            for (vertNum = 0; vertNum < render_count; vertNum++) {
+                vec3_t normal;
+                vec3_t out;
+                int    channelNum;
+                int    boneNum;
+
+                VectorClear(out);
+                VectorClear(outXyz);
+
+                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
+
+                channelNum = skelmodel->pBones[weight->boneIndex].channel;
+                boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
+                bone       = &bones[boneNum];
+
+                SkelVertGetNormal(newVerts, bone, normal);
+
+                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
+                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
+                    boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
+                    bone       = &bones[boneNum];
+
+                    SkelWeightGetXyz(weight, bone, out);
+
+                    weight++;
+                }
+
+                R_VaoPackNormal(outNormal, normal);
+                VectorScale(out, scale, outXyz);
+
+                outTc[vertNum * 2] = newVerts->texCoords[0];
+                outTc[vertNum * 2 + 1] = newVerts->texCoords[1];
+                // FIXME: fill in lightmapST for completeness?
+
+                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
+                                                + sizeof(skelWeight_t) * newVerts->numWeights);
+                outXyz += 4;
+                outNormal += 4;
+            }
+        } else {
+            for (vertNum = 0; vertNum < render_count; vertNum++) {
+                vec3_t normal;
+                vec3_t out;
+
+                VectorClear(out);
+                VectorClear(outXyz);
+
+                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
+
+                bone = &bones[weight->boneIndex];
+                SkelVertGetNormal(newVerts, bone, normal);
+
+                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
+                    bone = &bones[weight->boneIndex];
+
+                    SkelWeightGetXyz(weight, bone, out);
+
+                    weight++;
+                }
+
+                R_VaoPackNormal(outNormal, normal);
+                VectorScale(out, scale, outXyz);
+
+                outTc[vertNum * 2] = newVerts->texCoords[0];
+                outTc[vertNum * 2 + 1] = newVerts->texCoords[1];
+                // FIXME: fill in lightmapST for completeness?
+
+                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
+                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
+                                                + sizeof(skelWeight_t) * newVerts->numWeights);
+                outXyz += 4;
+                outNormal += 4;
+            }
+        }
+    }
+}
+
+/*
+=============
+HZM gl2 [bug-3487] SKINNING ON WORKER THREADS
+
+After the tess stream and the skin cache (bug-3483) the largest single cost left on a crowded map was still
+RB_SkelMesh + R_VaoPackNormal: the soldiers who ARE moving, about 1,400 surface skins a frame on Omaha, all on the
+one thread that also runs the game, the effects and every draw call.
+
+R_SkelPreskin runs at the top of each colour pass (never a depth-only pass: those skip most characters). It walks
+the draw list once, works out for every skeletal surface what RB_SkelMesh is about to ask for - (entity, surface,
+vertex count) - and
+  * if the skin cache already holds it, points the frame table at the cached copy;
+  * otherwise queues a job that skins it into a frame arena.
+The jobs run on r_hzmSkinThreads workers plus this thread, and the pass does not start until all are done, so the
+draw loop is exactly as single-threaded as before; RB_SkelMesh simply finds its vertices ready and copies them.
+A surface the prepass did not prepare (arena full, a depth pass, LOD tool, the feature off) is skinned inline by
+RB_SkelMesh as it always was, and a prepared one is only used when RB_SkelMesh's own vertex count matches the
+prepass's, so the two can never disagree about what is drawn.
+
+The table lasts the frame, not the pass: the same entity surface drawn again in a later list (a second pass, a
+shadow cascade at the same detail) reuses the skin.
+
+Workers only read: model data, TIKI_Skel_Bones, skeletorMorphCache (all frozen while the back end runs) and
+skelChannelList_s::LocalChannel (const). They write only their own job's slice of the arena.
+The threads are joined in RE_Shutdown - the renderer DLL is unloaded on every vid_restart.
+
+r_hzmSkinThreads: -1 = automatic (cores - 2, at most 6), 0 = off (inline, as before), N = that many workers. Live.
+=============
+*/
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+
+#define PS_SLOTS       16384
+#define PS_MAX_JOBS    8192
+#define PS_ARENA_BYTES (48 * 1024 * 1024)
+
+typedef struct {
+    trRefEntity_t     *ent;
+    skelSurfaceGame_t *sf;
+    int                rc;
+    int                frame;
+    const byte        *data;        // xyz[rc] | normal[rc] | texCoords[rc]
+} psEntry_t;
+
+typedef struct {
+    skelSurfaceGame_t *sf;
+    dtiki_t           *tiki;
+    skelHeaderGame_t  *skelmodel;
+    int                mesh;
+    unsigned int       rc;
+    float              scale;
+    skelBoneCache_t   *bones;
+    int               *morphs;
+    qboolean           hasMorph;
+    byte              *out;
+    skcEntry_t        *store;       // third identical sighting: keep the result in the skin cache
+} psJob_t;
+
+static psEntry_t s_ps[PS_SLOTS];
+static psJob_t   s_psJobs[PS_MAX_JOBS];
+static byte     *s_psArena;
+static int       s_psArenaUsed;
+static int       s_psFrame = -1;
+static int       s_psStatJobs, s_psStatHits, s_psStatUsed;
+static cvar_t   *r_hzmSkinThreads;
+
+static std::vector<std::thread> *s_psThreads;
+static std::mutex               *s_psMx;
+static std::condition_variable  *s_psWork, *s_psDone;
+static int                       s_psNum, s_psNext, s_psPending;
+static bool                      s_psQuit;
+
+static void PS_RunJob(const psJob_t *j)
+{
+    SKEL_Skin(j->sf, j->tiki, j->skelmodel, j->mesh, j->rc, j->scale, j->bones, j->morphs, j->hasMorph, (float *)j->out,
+              (int16_t *)(j->out + j->rc * sizeof(vec4_t)), (float *)(j->out + j->rc * (sizeof(vec4_t) + 4 * sizeof(int16_t))));
+}
+
+static void PS_Worker(void)
+{
+    std::unique_lock<std::mutex> lk(*s_psMx);
+
+    for (;;) {
+        s_psWork->wait(lk, [] { return s_psQuit || s_psNext < s_psNum; });
+        if (s_psQuit) {
+            return;
+        }
+        int i = s_psNext++;
+        lk.unlock();
+        PS_RunJob(&s_psJobs[i]);
+        lk.lock();
+        if (--s_psPending == 0) {
+            s_psDone->notify_all();
+        }
+    }
+}
+
+extern "C" void R_SkelThreadsShutdown(void)
+{
+    if (s_psThreads) {
+        {
+            std::lock_guard<std::mutex> lk(*s_psMx);
+            s_psQuit = true;
+        }
+        s_psWork->notify_all();
+        for (size_t i = 0; i < s_psThreads->size(); i++) {
+            (*s_psThreads)[i].join();
+        }
+        delete s_psThreads;
+        delete s_psWork;
+        delete s_psDone;
+        delete s_psMx;
+        s_psThreads = NULL;
+        s_psWork = s_psDone = NULL;
+        s_psMx   = NULL;
+        s_psQuit = false;
+    }
+    if (s_psArena) {
+        free(s_psArena);
+        s_psArena = NULL;
+    }
+    s_psFrame = -1;
+    s_psNum = s_psNext = s_psPending = 0;
+}
+
+static int PS_WantedWorkers(void)
+{
+    int n;
+
+    if (!r_hzmSkinThreads) {
+        r_hzmSkinThreads = ri.Cvar_Get("r_hzmSkinThreads", "-1", 0);
+    }
+    n = r_hzmSkinThreads->integer;
+    if (n < 0) {
+        n = (int)std::thread::hardware_concurrency() - 2;
+        if (n > 6) {
+            n = 6;
+        }
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > 16) {
+        n = 16;
+    }
+    return n;
+}
+
+static qboolean PS_EnsurePool(int workers)
+{
+    if (s_psThreads && (int)s_psThreads->size() != workers) {
+        R_SkelThreadsShutdown();
+    }
+    if (!s_psArena) {
+        s_psArena = (byte *)malloc(PS_ARENA_BYTES);
+        if (!s_psArena) {
+            return qfalse;
+        }
+    }
+    if (!s_psThreads) {
+        s_psMx      = new std::mutex;
+        s_psWork    = new std::condition_variable;
+        s_psDone    = new std::condition_variable;
+        s_psThreads = new std::vector<std::thread>;
+        s_psQuit    = false;
+        for (int i = 0; i < workers; i++) {
+            s_psThreads->emplace_back(PS_Worker);
+        }
+    }
+    return qtrue;
+}
+
+static unsigned int PS_Hash(trRefEntity_t *ent, skelSurfaceGame_t *sf, int rc)
+{
+    return ((unsigned int)((uintptr_t)ent >> 4) * 2654435761u) ^ ((unsigned int)((uintptr_t)sf >> 4) * 40503u)
+           ^ ((unsigned int)rc * 97u);
+}
+
+static psEntry_t *PS_Slot(trRefEntity_t *ent, skelSurfaceGame_t *sf, int rc, qboolean create)
+{
+    unsigned int idx = PS_Hash(ent, sf, rc);
+    int          p;
+
+    for (p = 0; p < 12; p++) {
+        psEntry_t *e = &s_ps[(idx + p) & (PS_SLOTS - 1)];
+
+        if (e->frame != s_psFrame) {
+            if (!create) {
+                return NULL;
+            }
+            e->ent   = ent;
+            e->sf    = sf;
+            e->rc    = rc;
+            e->frame = s_psFrame;
+            e->data  = NULL;
+            return e;
+        }
+        if (e->ent == ent && e->sf == sf && e->rc == rc) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/*
+=============
+SKEL_Prepare
+
+What RB_SkelMesh works out before it skins: which mesh the surface belongs to and how many vertices this level of
+detail draws. A plain copy of that logic without the diagnostics. If the two ever drift the only effect is that
+RB_SkelMesh does not find the prepared skin and skins inline.
+=============
+*/
+static qboolean SKEL_Prepare(skelSurfaceGame_t *sf, trRefEntity_t *ent, psJob_t *out)
+{
+    dtiki_t           *tiki = ent->e.tiki;
+    skelHeaderGame_t  *skelmodel = NULL;
+    skelSurfaceGame_t *psurface;
+    qboolean           bFound = qfalse;
+    unsigned int       render_count;
+    int                mesh, surf;
+
+    if (!tiki) {
+        return qfalse;
+    }
+    for (mesh = 0; mesh < tiki->numMeshes; mesh++) {
+        skelmodel = ri.TIKI_GetSkel(tiki->mesh[mesh]);
+        psurface  = skelmodel->pSurfaces;
+        for (surf = 0; surf < skelmodel->numSurfaces; surf++) {
+            if (psurface == sf) {
+                bFound = qtrue;
+                break;
+            }
+            psurface = psurface->pNext;
+        }
+        if (bFound) {
+            break;
+        }
+    }
+    if (!bFound) {
+        return qfalse;
+    }
+
+    qboolean tskForceLod0 = (qboolean)(r_test_forcelod0 && r_test_forcelod0->integer && tiki->a && tiki->a->bIsCharacter);
+    if (skelmodel->pLOD && !tskForceLod0) {
+        float lod_val  = ent->lodpercentage[0];
+        int   renderfx = ent->e.renderfx;
+
+        if (r_charShadows && r_charShadows->integer && (backEnd.viewParms.flags & VPF_DEPTHSHADOW) && r_charShadowLod
+            && r_charShadowLod->value > 0.0f && tiki->a && tiki->a->bIsCharacter) {
+            lod_val = r_charShadowLod->value;
+        }
+
+        if (sf->numVerts > 3) {
+            skelIndex_t *collapseIndex = sf->pCollapseIndex;
+            int          mid, low, high;
+            int          lod_cutoff = GetLodCutoff(skelmodel, lod_val, renderfx);
+
+            if (collapseIndex[2] < lod_cutoff) {
+                return qfalse;
+            }
+            low = mid = 3;
+            high      = sf->numVerts;
+            while (high >= low) {
+                mid = (low + high) >> 1;
+                if (collapseIndex[mid] < lod_cutoff) {
+                    high = mid - 1;
+                    if (collapseIndex[mid - 1] >= lod_cutoff) {
+                        break;
+                    }
+                } else {
+                    mid++;
+                    low = mid;
+                    if (high == mid || collapseIndex[mid] < lod_cutoff) {
+                        break;
+                    }
+                }
+            }
+            render_count = mid;
+        } else {
+            render_count = sf->numVerts;
+        }
+        if (!render_count) {
+            return qfalse;
+        }
+    } else {
+        render_count = sf->numVerts;
+    }
+
+    out->sf        = sf;
+    out->tiki      = tiki;
+    out->skelmodel = skelmodel;
+    out->mesh      = mesh;
+    out->rc        = render_count;
+    out->scale     = tiki->load_scale * ent->e.scale;
+    return qtrue;
+}
+
+/*
+=============
+R_SkelPreskin
+=============
+*/
+extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
+{
+    drawSurf_t *drawSurf;
+    int         workers = PS_WantedWorkers();
+    int         i, numJobs = 0;
+
+    if (!workers || (lod_tool && lod_tool->integer) || !r_drawentitypoly->integer) {
+        return;
+    }
+    if (!PS_EnsurePool(workers)) {
+        return;
+    }
+    if (!r_hzmSkelCache) {
+        r_hzmSkelCache = ri.Cvar_Get("r_hzmSkelCache", "1", 0);
+    }
+    if (s_psFrame != tr.frameCount) {
+        s_psFrame     = tr.frameCount;
+        s_psArenaUsed = 0;
+    }
+
+    for (i = 0, drawSurf = drawSurfs; i < numDrawSurfs; i++, drawSurf++) {
+        shader_t          *shader;
+        int                entityNum, fogNum, dlighted, pshadowed;
+        qboolean           bStaticModel;
+        trRefEntity_t     *ent;
+        skelSurfaceGame_t *sf;
+        psJob_t            job;
+        psEntry_t         *slot;
+        skcEntry_t        *skc = NULL;
+        int                bytes, nMorph;
+        uint64_t           hash;
+
+        if (*drawSurf->surface != SF_TIKI_SKEL) {
+            continue;
+        }
+        R_DecomposeSort(drawSurf->sort, &entityNum, &shader, &fogNum, &dlighted, &pshadowed, &bStaticModel);
+        if (bStaticModel || entityNum == REFENTITYNUM_WORLD) {
+            continue;
+        }
+        ent = &backEnd.refdef.entities[entityNum];
+        sf  = (skelSurfaceGame_t *)drawSurf->surface;
+        if (!SKEL_Prepare(sf, ent, &job) || job.rc < 24) {
+            continue;
+        }
+        slot = PS_Slot(ent, sf, (int)job.rc, qtrue);
+        if (!slot || slot->data) {
+            continue;       // table crowded here (inline will do it), or already prepared this frame
+        }
+
+        job.bones    = &TIKI_Skel_Bones[ent->e.bonestart];
+        job.morphs   = &skeletorMorphCache[ent->e.morphstart];
+        job.hasMorph = (qboolean)(ent->e.hasMorph != 0);
+        job.store    = NULL;
+
+        if (r_hzmSkelCache->integer) {
+            hash   = SKC_HashBones(job.bones, ri.TIKI_GetNumChannels(job.tiki));
+            nMorph = (int)ent->e.hasMorph;
+            if (nMorph > 0) {
+                int mi;
+                for (mi = 0; mi < nMorph; mi++) {
+                    hash ^= (uint64_t)(unsigned int)job.morphs[mi] + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
+                }
+                hash ^= (uint64_t)nMorph << 48;
+            }
+            skc = SKC_Lookup(ent->e.entityNumber, sf, (int)job.rc, job.scale, hash);
+            if (skc && skc->valid) {
+                skc->hitFrame = tr.frameCount;      // its buffer is in use until this frame is drawn
+                slot->data    = skc->data;
+                s_psStatHits++;
+                s_skcHit++;
+                continue;
+            }
+            if (skc) {
+                s_skcMiss++;
+                if (skc->same >= 2 && skc->hitFrame != tr.frameCount) {
+                    job.store = skc;
+                }
+            }
+        }
+
+        bytes = (int)((job.rc * SKC_VERT_BYTES + 63) & ~(size_t)63);
+        if (numJobs >= PS_MAX_JOBS || s_psArenaUsed + bytes > PS_ARENA_BYTES) {
+            slot->frame = -1;       // give the slot back: RB_SkelMesh skins this one inline
+            continue;
+        }
+        job.out = s_psArena + s_psArenaUsed;
+        s_psArenaUsed += bytes;
+        slot->data = job.out;
+        s_psJobs[numJobs++] = job;
+    }
+
+    if (!numJobs) {
+        return;
+    }
+    s_psStatJobs += numJobs;
+
+    {
+        std::unique_lock<std::mutex> lk(*s_psMx);
+        s_psNum     = numJobs;
+        s_psNext    = 0;
+        s_psPending = numJobs;
+        lk.unlock();
+        s_psWork->notify_all();
+        lk.lock();
+        // this thread works too
+        while (s_psNext < s_psNum) {
+            int k = s_psNext++;
+            lk.unlock();
+            PS_RunJob(&s_psJobs[k]);
+            lk.lock();
+            --s_psPending;
+        }
+        s_psDone->wait(lk, [] { return s_psPending == 0; });
+        s_psNum = s_psNext = 0;
+    }
+
+    for (i = 0; i < numJobs; i++) {
+        if (s_psJobs[i].store) {
+            SKC_StoreFrom(s_psJobs[i].store, s_psJobs[i].out, (int)s_psJobs[i].rc);
+        }
+    }
 }
 
 void RB_SkelMesh(skelSurfaceGame_t *sf)
@@ -1897,6 +2575,19 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
     if (!r_hzmSkelCache) {
         r_hzmSkelCache = ri.Cvar_Get("r_hzmSkelCache", "1", 0);
     }
+    // HZM gl2 [bug-3487] prepared by R_SkelPreskin (worker threads, or a skin-cache hit found there)?
+    if (s_psFrame == tr.frameCount && render_count >= 24) {
+        psEntry_t *psE = PS_Slot(backEnd.currentEntity, sf, (int)render_count, qfalse);
+        if (psE && psE->data) {
+            memcpy(outXyz, psE->data, render_count * sizeof(vec4_t));
+            memcpy(outNormal, psE->data + render_count * sizeof(vec4_t), render_count * 4 * sizeof(int16_t));
+            memcpy(tess.texCoords[baseVertex], psE->data + render_count * (sizeof(vec4_t) + 4 * sizeof(int16_t)),
+                   render_count * sizeof(vec2_t));
+            s_psStatUsed++;
+            goto skc_skinned;
+        }
+    }
+
     if (r_hzmSkelCache->integer && render_count >= 24) {
         uint64_t skcHash = SKC_HashBones(bones, ri.TIKI_GetNumChannels(tiki));
         int      skcMorphs = (int)backEnd.currentEntity->e.hasMorph;
@@ -1909,7 +2600,7 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
             skcHash ^= (uint64_t)skcMorphs << 48;
         }
         skc = SKC_Lookup(backEnd.currentEntity->e.entityNumber, sf, (int)render_count, scale, skcHash);
-        if (skc->valid) {
+        if (skc && skc->valid) {
             memcpy(outXyz, skc->data, render_count * sizeof(vec4_t));
             memcpy(outNormal, skc->data + render_count * sizeof(vec4_t), render_count * 4 * sizeof(int16_t));
             memcpy(tess.texCoords[baseVertex], skc->data + render_count * (sizeof(vec4_t) + 4 * sizeof(int16_t)),
@@ -1921,209 +2612,8 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
         s_skcMiss++;
     }
 
-    if (backEnd.currentEntity->e.hasMorph) {
-        if (mesh > 0) {
-            for (vertNum = 0; vertNum < render_count; vertNum++) {
-                vec3_t normal;
-                vec3_t out;
-                vec3_t totalmorph;
-                int    channelNum;
-                int    boneNum;
-
-                VectorClear(out);
-                VectorClear(outXyz);
-                VectorClear(totalmorph);
-
-                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
-                morph  = (skeletorMorph_t *)((byte *)newVerts + sizeof(skeletorVertex_t));
-
-                for (morphNum = 0; morphNum < newVerts->numMorphs; morphNum++) {
-                    morphcache = &morphs[morph->morphIndex];
-
-                    if (*morphcache) {
-                        SkelMorphGetXyz(morph, morphcache, totalmorph);
-                    }
-
-                    morph++;
-                }
-
-                if (newVerts->numMorphs) {
-                    channelNum = skelmodel->pBones[morph->morphIndex].channel;
-                } else {
-                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
-                }
-
-                boneNum = ri.TIKI_GetLocalChannel(tiki, channelNum);
-                bone    = &bones[boneNum];
-
-                SkelVertGetNormal(newVerts, bone, normal);
-
-                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
-                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
-                    boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
-                    bone       = &bones[boneNum];
-
-                    if (!weightNum) {
-                        SkelWeightMorphGetXyz(weight, bone, totalmorph, out);
-                    } else {
-                        SkelWeightGetXyz(weight, bone, out);
-                    }
-
-                    weight++;
-                }
-
-                R_VaoPackNormal(outNormal, normal);
-                VectorScale(out, scale, outXyz);
-
-                tess.texCoords[baseVertex + vertNum][0] = newVerts->texCoords[0];
-                tess.texCoords[baseVertex + vertNum][1] = newVerts->texCoords[1];
-                // FIXME: fill in lightmapST for completeness?
-
-                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
-                                                + sizeof(skelWeight_t) * newVerts->numWeights);
-                outXyz += 4;
-                outNormal += 4;
-            }
-        } else {
-            for (vertNum = 0; vertNum < render_count; vertNum++) {
-                vec3_t normal;
-                vec3_t out;
-                vec3_t totalmorph;
-
-                VectorClear(out);
-                VectorClear(outXyz);
-                VectorClear(totalmorph);
-
-                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
-                morph  = (skeletorMorph_t *)((byte *)newVerts + sizeof(skeletorVertex_t));
-
-                for (morphNum = 0; morphNum < newVerts->numMorphs; morphNum++) {
-                    morphcache = &morphs[morph->morphIndex];
-
-                    if (*morphcache) {
-                        SkelMorphGetXyz(morph, morphcache, totalmorph);
-                    }
-
-                    morph++;
-                }
-
-                if (newVerts->numMorphs) {
-                    bone = &bones[morph->morphIndex];
-                } else {
-                    bone = &bones[weight->boneIndex];
-                }
-
-                SkelVertGetNormal(newVerts, bone, normal);
-
-                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
-                    bone = &bones[weight->boneIndex];
-
-                    if (!weightNum) {
-                        SkelWeightMorphGetXyz(weight, bone, totalmorph, out);
-                    } else {
-                        SkelWeightGetXyz(weight, bone, out);
-                    }
-
-                    weight++;
-                }
-
-                R_VaoPackNormal(outNormal, normal);
-                VectorScale(out, scale, outXyz);
-
-                tess.texCoords[baseVertex + vertNum][0] = newVerts->texCoords[0];
-                tess.texCoords[baseVertex + vertNum][1] = newVerts->texCoords[1];
-                // FIXME: fill in lightmapST for completeness?
-
-                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
-                                                + sizeof(skelWeight_t) * newVerts->numWeights);
-                outXyz += 4;
-                outNormal += 4;
-            }
-        }
-    } else {
-        if (mesh > 0) {
-            for (vertNum = 0; vertNum < render_count; vertNum++) {
-                vec3_t normal;
-                vec3_t out;
-                int    channelNum;
-                int    boneNum;
-
-                VectorClear(out);
-                VectorClear(outXyz);
-
-                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
-
-                channelNum = skelmodel->pBones[weight->boneIndex].channel;
-                boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
-                bone       = &bones[boneNum];
-
-                SkelVertGetNormal(newVerts, bone, normal);
-
-                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
-                    channelNum = skelmodel->pBones[weight->boneIndex].channel;
-                    boneNum    = ri.TIKI_GetLocalChannel(tiki, channelNum);
-                    bone       = &bones[boneNum];
-
-                    SkelWeightGetXyz(weight, bone, out);
-
-                    weight++;
-                }
-
-                R_VaoPackNormal(outNormal, normal);
-                VectorScale(out, scale, outXyz);
-
-                tess.texCoords[baseVertex + vertNum][0] = newVerts->texCoords[0];
-                tess.texCoords[baseVertex + vertNum][1] = newVerts->texCoords[1];
-                // FIXME: fill in lightmapST for completeness?
-
-                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
-                                                + sizeof(skelWeight_t) * newVerts->numWeights);
-                outXyz += 4;
-                outNormal += 4;
-            }
-        } else {
-            for (vertNum = 0; vertNum < render_count; vertNum++) {
-                vec3_t normal;
-                vec3_t out;
-
-                VectorClear(out);
-                VectorClear(outXyz);
-
-                weight = (skelWeight_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                          + sizeof(skeletorMorph_t) * newVerts->numMorphs);
-
-                bone = &bones[weight->boneIndex];
-                SkelVertGetNormal(newVerts, bone, normal);
-
-                for (weightNum = 0; weightNum < newVerts->numWeights; weightNum++) {
-                    bone = &bones[weight->boneIndex];
-
-                    SkelWeightGetXyz(weight, bone, out);
-
-                    weight++;
-                }
-
-                R_VaoPackNormal(outNormal, normal);
-                VectorScale(out, scale, outXyz);
-
-                tess.texCoords[baseVertex + vertNum][0] = newVerts->texCoords[0];
-                tess.texCoords[baseVertex + vertNum][1] = newVerts->texCoords[1];
-                // FIXME: fill in lightmapST for completeness?
-
-                newVerts = (skeletorVertex_t *)((byte *)newVerts + sizeof(skeletorVertex_t)
-                                                + sizeof(skeletorMorph_t) * newVerts->numMorphs
-                                                + sizeof(skelWeight_t) * newVerts->numWeights);
-                outXyz += 4;
-                outNormal += 4;
-            }
-        }
-    }
+    SKEL_Skin(sf, tiki, skelmodel, mesh, render_count, scale, bones, morphs,
+              (qboolean)(backEnd.currentEntity->e.hasMorph != 0), outXyz, outNormal, tess.texCoords[baseVertex]);
 
     // HZM gl2 [bug-3483] third identical sighting in a row: keep what was just skinned
     if (skc && skc->same >= 2) {
@@ -2131,9 +2621,12 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
     }
 skc_skinned:
     if (r_hzmSkelCache->integer == 2 && tr.frameCount - s_skcStatFrame > 120) {
-        ri.Printf(PRINT_ALL, "^~^~^ SKELCACHE hit=%d miss=%d store=%d over %d frames, %d KB held\n", s_skcHit, s_skcMiss,
-                  s_skcStore, tr.frameCount - s_skcStatFrame, s_skcBytes / 1024);
+        ri.Printf(PRINT_ALL, "^~^~^ SKELCACHE hit=%d miss=%d store=%d over %d frames, %d KB held | threads=%d jobs=%d "
+                  "prepared-hits=%d used=%d arena=%d KB\n", s_skcHit, s_skcMiss, s_skcStore, tr.frameCount - s_skcStatFrame,
+                  s_skcBytes / 1024, s_psThreads ? (int)s_psThreads->size() : 0, s_psStatJobs, s_psStatHits, s_psStatUsed,
+                  s_psArenaUsed / 1024);
         s_skcHit = s_skcMiss = s_skcStore = 0;
+        s_psStatJobs = s_psStatHits = s_psStatUsed = 0;
         s_skcStatFrame = tr.frameCount;
     }
 
