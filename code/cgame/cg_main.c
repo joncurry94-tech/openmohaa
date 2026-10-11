@@ -1026,6 +1026,8 @@ void CG_Init(clientGameImport_t *imported, int serverMessageNum, int serverComma
     // E2 session flag: zeroed on every cgame init so an MP session from a previous connection never
     // bleeds into the next. The server stuffs "set coop_mp_session 1" when mp.scr starts.
     cgi.Cvar_Set("coop_mp_session", "0");
+    // [bug-3485] the pinned enemies-remaining line (cg_coopfeed.c) never survives a connect or a map load
+    cgi.Cvar_Set("coop_ecLine", "");
     // HZM-MP-END(mp_armory_session)
 
     // HZM-MP-BEGIN(mp_kit_userinfo)

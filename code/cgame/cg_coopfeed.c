@@ -471,6 +471,56 @@ static void CG_FeedTick(const float *col)
 CG_DrawCoopFeed - called every frame from the 2D HUD pass (cg_drawtools.cpp, next to the stamina arc).
 cineHide = the coop cinematic HUD suppression is active.
 */
+/*
+====================
+CG_DrawCoopPinned
+
+HZM coop [bug-3485, user 2026-10-11: "Make the enemies remaining text smaller"] The enemies-remaining readout
+(coop_mod/enemycount.scr) as ONE pinned line at the top right, in the feed's own type: verdana-12 in hi-res units,
+i.e. 12 px at 1080p and below and scaled above - the script HUD could only draw that font at virtual-480 scale,
+1.5x to 2.25x larger, and has no smaller font. The server sets the text with `set coop_ecLine <text>` and clears
+it with "-"; CG_Init clears it on every connect and map load (cg_main.c), so a line can never outlive
+the mission that set it.
+====================
+*/
+static void CG_DrawCoopPinned(void)
+{
+    static cvar_t *cvLine = NULL;
+    fontheader_t  *font;
+    char           text[96];
+    vec4_t         c;
+    float          x, y;
+
+    if (!cvLine) {
+        cvLine = cgi.Cvar_Get("coop_ecLine", "", 0);
+    }
+    // "" or "-" = nothing to show ("-" because a script cannot send an empty value: stufftext has no inner quotes)
+    if (!cvLine->string[0] || (cvLine->string[0] == '-' && !cvLine->string[1])) {
+        return;
+    }
+    font = CG_FeedFont();
+    if (!font) {
+        return;
+    }
+    CG_FeedClean(cvLine->string, text, sizeof(text));
+    if (!text[0]) {
+        return;
+    }
+    x = (float)cgs.glconfig.vidWidth / cgs.uiHiResScale[0] - CG_FeedTextW(text, -1) - 16.0f;
+    y = 8.0f;
+    c[0] = c[1] = c[2] = 0.0f;
+    c[3]                = 0.85f;
+    cgi.R_SetColor(c);
+    cgi.R_DrawString(font, text, x + 1.0f, y + 1.0f, -1, cgs.uiHiResScale);
+    c[0] = 1.00f;
+    c[1] = 0.86f;
+    c[2] = 0.55f;
+    c[3] = 0.95f;
+    cgi.R_SetColor(c);
+    cgi.R_DrawString(font, text, x, y, -1, cgs.uiHiResScale);
+    cgi.R_SetColor(NULL);
+}
+
 void CG_DrawCoopFeed(qboolean cineHide)
 {
     static const float tick[5][3] = {
@@ -486,6 +536,9 @@ void CG_DrawCoopFeed(qboolean cineHide)
     fontheader_t *font;
 
     CG_CoopFeedInit();
+    if (!cineHide) {
+        CG_DrawCoopPinned();        // [bug-3485] not part of the feed: coop_feed 0 does not hide it
+    }
     now = cg.time;
     dt  = now - s_feedLastT;
     if (dt < 0 || dt > 250) {
