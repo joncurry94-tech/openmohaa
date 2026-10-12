@@ -354,10 +354,12 @@ dtiki_t *R_Model_GetHandle(qhandle_t handle)
 ** R_FreeModel
 */
 extern "C" void R_SkelCacheFlush(void);
+extern "C" void R_SkelPoseMemoFlush(void);
 
 void R_FreeModel(model_t *mod)
 {
     R_SkelCacheFlush();     // HZM gl2 [bug-3483] the skin cache is keyed by surface pointers
+    R_SkelPoseMemoFlush();  // HZM gl2 [render-perf 1] the pose memo is keyed by model pointers
     if (mod->type == MOD_TIKI) {
         ri.CG_EndTiki(mod->d.tiki);
     }
@@ -1096,9 +1098,253 @@ extern "C" void R_HzmPerfFrame(void)
     }
 }
 
+/*
+=============
+HZM gl2 [render-perf 1] THE POSE MEMO
+
+Every skeletal model was posed from scratch every time it was added to a view: TIKI_SetPoseInternal, then the whole
+bone hierarchy evaluated (skeletor_c::GetFrame - every bone dirty), then copied out. That is once for the main view
+and once more for every shadow view the model is in, every frame, for a soldier who has been lying dead on the sand
+for a minute exactly as for one who is running.
+
+The pose is a pure function of what the entity hands over: its sixteen (animation, time, weight) slots, the action
+weight and the bone controllers. So the bones of the last pose are kept per entity number, with those inputs:
+
+  EXACT  the inputs are bit-for-bit the ones the kept bones came from (a dead soldier, a held weapon, a parked
+         vehicle - and ANY model in the second and later views of one frame): the kept bones are copied. Any size
+         on screen, nothing approximated. Refreshed every ~half second regardless.
+  HOLD   (r_hzmSkelPoseLod 2) the model is SMALL ON SCREEN - its radius under r_hzmSkelPoseLodSize of the half
+         screen height - and is still playing the same animations: the kept pose is shown for at most
+         r_hzmSkelPoseLodMs milliseconds (twice that under half the size), then it is posed again. Entities take
+         turns (frame + entity number), so the work is spread evenly instead of landing on one frame in N.
+         The model's ORIGIN and angles are applied fresh every frame as always - a distant soldier moves across the
+         ground exactly as before, only his limbs update a little less often. A new animation, an animation
+         restarting, a weight jumping: posed at once. Frame rate too low for a hold to fit in the budget: no hold.
+
+Never: the first-person model, depth-hack models, a ragdoll, entities without a number (client effects), the LOD
+tool. The bones are COPIED (the pool they live in is reset every scene).
+
+A held model hands the skin cache the same bones again, so its skin is found there instead of being recomputed;
+models that are small this frame have their skin kept on first sight for exactly that (PM_IsSmall).
+
+r_hzmSkelPoseLod 0 = off, 1 = EXACT only, 2 = EXACT + HOLD. Live.
+3 = verify: as 1, but every EXACT answer is also posed for real and the two bone blocks compared bit for bit
 (r_hzmPerfStats 1 prints the count checked and the count that differed, which has to stay 0).
 =============
 */
+#define PM_CTRL 8
+
+enum {
+    PM_POSE,
+    PM_EXACT,
+    PM_HOLD
+};
+
+typedef struct {
+    qboolean         valid;
+    dtiki_t         *tiki;
+    int              hModel;
+    int              numTags;
+    int              numMorph;
+    float            scale;
+    float            radius;
+    float            actionWeight;
+    int              numCtrl;
+    int              ctrlTag[PM_CTRL];
+    vec4_t           ctrlQuat[PM_CTRL];
+    frameInfo_t      fi[MAX_FRAMEINFOS];
+    int              poseFrame;         // tr.frameCount the kept bones were computed in
+    int              poseMs;
+    int              smallFrame;        // last frame it was small on screen
+    skelBoneCache_t *bones;
+    int             *morphs;
+    int              bonesCap, morphsCap;
+} poseMemo_t;
+
+static poseMemo_t s_pm[MAX_GENTITIES];
+static cvar_t    *r_hzmSkelPoseLod, *r_hzmSkelPoseLodSize, *r_hzmSkelPoseLodMs;
+static int        s_pmFrame = -1, s_pmNowMs;
+static float      s_pmFrameMs = 100.0f;
+
+extern "C" void R_SkelPoseMemoFlush(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_GENTITIES; i++) {
+        if (s_pm[i].bones) {
+            free(s_pm[i].bones);
+        }
+        if (s_pm[i].morphs) {
+            free(s_pm[i].morphs);
+        }
+    }
+    memset(s_pm, 0, sizeof(s_pm));
+    s_pmFrame = -1;
+}
+
+static int PM_NumCtrl(const refEntity_t *e)
+{
+    if (!e->bone_tag || !e->bone_quat) {
+        return 0;
+    }
+    return e->bone_count > 0 ? e->bone_count : NUM_BONE_CONTROLLERS;
+}
+
+static qboolean PM_IsSmall(int entityNumber)
+{
+    return (qboolean)(entityNumber >= 0 && entityNumber < MAX_GENTITIES && s_pm[entityNumber].valid
+                      && s_pm[entityNumber].smallFrame == tr.frameCount);
+}
+
+static int PM_Decide(trRefEntity_t *ent, dtiki_t *tiki, int numTags, poseMemo_t **pm)
+{
+    refEntity_t *e = &ent->e;
+    poseMemo_t  *m;
+    int          nCtrl, i, age, period;
+    float        dist, tanHalf, size, maxAge;
+
+    *pm = NULL;
+    if (!r_hzmSkelPoseLod) {
+        r_hzmSkelPoseLod     = ri.Cvar_Get("r_hzmSkelPoseLod", "2", 0);
+        r_hzmSkelPoseLodSize = ri.Cvar_Get("r_hzmSkelPoseLodSize", "0.06", 0);
+        r_hzmSkelPoseLodMs   = ri.Cvar_Get("r_hzmSkelPoseLodMs", "34", 0);
+    }
+    if (!r_hzmSkelPoseLod->integer || lod_tool->integer) {
+        return PM_POSE;
+    }
+    if (e->entityNumber < 0 || e->entityNumber >= MAX_GENTITIES || e->entityNumber == ENTITYNUM_NONE) {
+        return PM_POSE;
+    }
+    if (e->renderfx & (RF_FIRST_PERSON | RF_DEPTHHACK)) {
+        return PM_POSE;
+    }
+    nCtrl = PM_NumCtrl(e);
+    if (nCtrl > PM_CTRL || R_RagdollSlotFor(e->entityNumber, tiki)) {
+        return PM_POSE;
+    }
+
+    if (s_pmFrame != tr.frameCount) {
+        int now = ri.Milliseconds();
+        int dt  = now - s_pmNowMs;
+
+        if (s_pmFrame != tr.frameCount - 1 || dt >= 100) {
+            s_pmFrameMs = 100.0f;       // a gap or a hitch: nothing is held until the rate is known again
+        } else {
+            s_pmFrameMs += ((float)(dt < 1 ? 1 : dt) - s_pmFrameMs) * 0.25f;
+        }
+        s_pmNowMs = now;
+        s_pmFrame = tr.frameCount;
+    }
+
+    m   = &s_pm[e->entityNumber];
+    *pm = m;
+    if (!m->valid || m->tiki != tiki || m->hModel != e->hModel || m->numTags != numTags || m->scale != e->scale
+        || m->numCtrl != nCtrl) {
+        return PM_POSE;
+    }
+
+    if (m->actionWeight == e->actionWeight && !memcmp(m->fi, e->frameInfo, sizeof(m->fi))
+        && (!nCtrl
+            || (!memcmp(m->ctrlTag, e->bone_tag, nCtrl * sizeof(int))
+                && !memcmp(m->ctrlQuat, e->bone_quat, nCtrl * sizeof(vec4_t))))) {
+        if (m->poseFrame == tr.frameCount || s_pmNowMs - m->poseMs < 400 + (e->entityNumber * 37) % 200) {
+            return PM_EXACT;
+        }
+        return PM_POSE;
+    }
+
+    if (r_hzmSkelPoseLod->integer != 2) {
+        return PM_POSE;
+    }
+
+    // small on screen? the kept radius against the half screen height at this distance (the scene's camera, so
+    // every view of one frame gets the same answer)
+    dist    = Distance(e->origin, tr.refdef.vieworg);
+    tanHalf = tan(tr.refdef.fov_y * (M_PI / 360.0));
+    if (tanHalf < 0.01f) {
+        tanHalf = 0.01f;
+    }
+    size = m->radius / (dist * tanHalf + 1.0f);
+    if (size >= r_hzmSkelPoseLodSize->value) {
+        return PM_POSE;
+    }
+    m->smallFrame = tr.frameCount;
+
+    // still the same animations, at nearly the same weights, a moment later?
+    for (i = 0; i < MAX_FRAMEINFOS; i++) {
+        const frameInfo_t *a = &m->fi[i], *b = &e->frameInfo[i];
+
+        if ((a->weight > 0.0f) != (b->weight > 0.0f)) {
+            return PM_POSE;
+        }
+        if (b->weight > 0.0f
+            && (a->index != b->index || fabs(a->time - b->time) > 0.25f || fabs(a->weight - b->weight) > 0.25f)) {
+            return PM_POSE;
+        }
+    }
+
+    maxAge = r_hzmSkelPoseLodMs->value;
+    if (size < r_hzmSkelPoseLodSize->value * 0.5f) {
+        maxAge *= 2.0f;
+    }
+    if (maxAge > 150.0f) {
+        maxAge = 150.0f;
+    }
+    period = (int)(maxAge / s_pmFrameMs) + 1;
+    if (period > 6) {
+        period = 6;
+    }
+    age = s_pmNowMs - m->poseMs;
+    if (period < 2 || ((unsigned int)(tr.frameCount + e->entityNumber) % (unsigned int)period) == 0
+        || (float)age > maxAge + s_pmFrameMs * 0.5f) {
+        return PM_POSE;
+    }
+    return PM_HOLD;
+}
+
+static void PM_Store(poseMemo_t *m, trRefEntity_t *ent, dtiki_t *tiki, int numTags, float radius,
+                     const skelBoneCache_t *bones, const int *morphs, int numMorph)
+{
+    refEntity_t *e     = &ent->e;
+    int          nCtrl = PM_NumCtrl(e);
+
+    m->valid = qfalse;
+    if (numTags > m->bonesCap) {
+        free(m->bones);
+        m->bones    = (skelBoneCache_t *)malloc(numTags * sizeof(skelBoneCache_t));
+        m->bonesCap = m->bones ? numTags : 0;
+    }
+    if (numMorph > m->morphsCap) {
+        free(m->morphs);
+        m->morphs    = (int *)malloc(numMorph * sizeof(int));
+        m->morphsCap = m->morphs ? numMorph : 0;
+    }
+    if (numTags > m->bonesCap || numMorph > m->morphsCap) {
+        return;
+    }
+    memcpy(m->bones, bones, numTags * sizeof(skelBoneCache_t));
+    if (numMorph > 0) {
+        memcpy(m->morphs, morphs, numMorph * sizeof(int));
+    }
+    m->tiki         = tiki;
+    m->hModel       = e->hModel;
+    m->numTags      = numTags;
+    m->numMorph     = numMorph;
+    m->scale        = e->scale;
+    m->radius       = radius;
+    m->actionWeight = e->actionWeight;
+    m->numCtrl      = nCtrl;
+    memcpy(m->fi, e->frameInfo, sizeof(m->fi));
+    if (nCtrl) {
+        memcpy(m->ctrlTag, e->bone_tag, nCtrl * sizeof(int));
+        memcpy(m->ctrlQuat, e->bone_quat, nCtrl * sizeof(vec4_t));
+    }
+    m->poseFrame = tr.frameCount;
+    m->poseMs    = s_pmNowMs;
+    m->valid     = qtrue;
+}
+
+/*
 ==============
 R_AddSkelSurfaces
 ==============
@@ -1132,6 +1378,11 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
     int mesh;
     int iRadiusCull = 0;
     int num_tags;
+    poseMemo_t      *pmMemo = NULL;      // HZM gl2 [render-perf 1] the pose memo
+    int              pmMode;
+    qboolean         pmCopied = qfalse;
+    qboolean         pmVerify = qfalse;
+    skelBoneCache_t *coopCacheStart;
 
     tiki = ent->e.tiki;
 
@@ -1271,7 +1522,18 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
     // redundant re-pose to their own current pose). r_test_forcepose (default 1) can disable for A/B.
     // g_skeldiagMainPose is captured here because R_GetFrame's redundant R_UpdatePoseInternal call
     // clobbers g_skeldiagPoseRan afterwards.
-    if (!r_test_forcepose || r_test_forcepose->integer) {
+    // HZM gl2 [render-perf 1] the pose memo (see THE POSE MEMO above): are the bones this entity was last given still
+    // the right ones? Then nothing below poses it.
+    num_tags = ri.TIKI_GetNumChannels(tiki);
+    pmMode   = diagCapture ? PM_POSE : PM_Decide(ent, tiki, num_tags, &pmMemo);
+    hzmPerf.skelAdds++;
+    if (pmMode == PM_EXACT && r_hzmSkelPoseLod->integer == 3) {
+        pmVerify = qtrue;       // pose it anyway; compared with the kept bones where they are stored below
+        pmMode   = PM_POSE;
+    }
+    if (pmMode != PM_POSE) {
+        g_skeldiagMainPose = 0; // reused
+    } else if (!r_test_forcepose || r_test_forcepose->integer) {
         RE_ForceUpdatePose(&ent->e);
         g_skeldiagMainPose = 3; // FORCED
     } else {
@@ -1314,7 +1576,7 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
     VectorScale(tiki->load_origin, tiki_scale, tiki_localorigin);
     R_LocalPointToWorld(tiki_localorigin, tiki_worldorigin);
 
-    radius = R_GetRadius(&ent->e);
+    radius = (pmMode != PM_POSE) ? pmMemo->radius : R_GetRadius(&ent->e);
 
     if (!lod_tool->integer) {
         iRadiusCull = R_CullPointAndRadius(tiki_worldorigin, radius);
@@ -1398,6 +1660,35 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
         }
     }
 
+    if (pmMode != PM_POSE) {
+        // HZM gl2 [render-perf 1] the kept bones (and for a held pose the kept morph weights, so the skin cache sees
+        // exactly the same input again). No ragdoll here: PM_Decide refuses those.
+        memcpy(outbones, pmMemo->bones, num_tags * sizeof(skelBoneCache_t));
+        ent->e.bonestart = TIKI_Skel_Bones_Index;
+        TIKI_Skel_Bones_Index += num_tags;
+        ent->e.hasMorph   = qfalse;
+        ent->e.morphstart = skeletorMorphCacheIndex;
+        if (pmMode == PM_HOLD) {
+            added = pmMemo->numMorph;
+            if (added > 0) {
+                memcpy(&skeletorMorphCache[skeletorMorphCacheIndex], pmMemo->morphs, added * sizeof(int));
+            }
+            hzmPerf.skelHold++;
+        } else {
+            skeletor = (skeletor_c *)ri.TIKI_GetSkeletor(tiki, ent->e.entityNumber);
+            added    = ri.SKEL_GetMorphWeightFrame(
+                skeletor, ent->e.frameInfo[0].index, ent->e.frameInfo[0].time, &skeletorMorphCache[skeletorMorphCacheIndex]
+            );
+            hzmPerf.skelExact++;
+        }
+        if (added) {
+            skeletorMorphCacheIndex += added;
+            ent->e.hasMorph = (qboolean)added;
+        }
+        goto pm_bones_ready;
+    }
+    hzmPerf.skelPosed++;
+
     newFrame = (skelAnimFrame_t *)ri.Hunk_AllocateTempMemory(
         sizeof(skelAnimFrame_t) + ri.TIKI_GetNumChannels(tiki) * sizeof(SkelMat4)
     );
@@ -1420,7 +1711,7 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
                                  && (diagFMax[2] - diagFMin[2] < 0.5f));
     }
 
-    skelBoneCache_t *coopCacheStart = outbones; // HZM coop ragdoll - Hook A writes this region
+    coopCacheStart = outbones; // HZM coop ragdoll - Hook A writes this region
 
     if (lod_tool->integer || iRadiusCull != CULL_CLIP
         || R_CullSkelModel(tiki, &ent->e, newFrame, tiki_scale, tiki_localorigin) != CULL_OUT) {
@@ -1443,6 +1734,7 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
             outbones->matrix[2][3] = 0;
             outbones++;
         }
+        pmCopied = qtrue;
     }
 
     // HZM coop - RAGDOLL Hook A (gl2 lockstep of the gl1 hook; see renderergl1/tr_model.cpp):
@@ -1482,6 +1774,18 @@ void R_AddSkelSurfaces(trRefEntity_t *ent)
         // needs to know how many morph weights belong to this entity to hash them
         ent->e.hasMorph = (qboolean)added;
     }
+
+    // HZM gl2 [render-perf 1] keep what was just worked out (pmMemo is NULL for anything the memo never touches)
+    if (pmMemo && pmCopied) {
+        if (pmVerify) {
+            hzmPerf.verifyPose++;
+            if (memcmp(pmMemo->bones, coopCacheStart, num_tags * sizeof(skelBoneCache_t)) || pmMemo->radius != radius) {
+                hzmPerf.verifyPoseBad++;
+            }
+        }
+        PM_Store(pmMemo, ent, tiki, num_tags, radius, coopCacheStart, &skeletorMorphCache[ent->e.morphstart], added);
+    }
+pm_bones_ready:
 
     //
     // draw all meshes
@@ -1903,12 +2207,15 @@ static void SKC_Store(skcEntry_t *e, int baseVertex, int rc)
     SKC_StoreFrom(e, tmp, rc);
 }
 
-static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
+/*
+SKC_Reserve - [render-perf 1] the entry has a buffer for rc vertices (qfalse: the cache is full, or the buffer is on loan)
+*/
+static qboolean SKC_Reserve(skcEntry_t *e, int rc)
 {
     int bytes = rc * (int)SKC_VERT_BYTES;
 
     if (e->hitFrame == tr.frameCount) {
-        return;     // [bug-3487] its buffer is on loan to the frame table until this frame is drawn
+        return qfalse;     // [bug-3487] its buffer is on loan to the frame table until this frame is drawn
     }
 
     if (!e->data) {
@@ -1925,17 +2232,25 @@ static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
                 }
             }
             if (s_skcBytes + bytes > SKC_MAX_BYTES) {
-                return;
+                return qfalse;
             }
         }
         e->data = (byte *)malloc(bytes);
         if (!e->data) {
-            return;
+            return qfalse;
         }
         e->bytes = bytes;
         s_skcBytes += bytes;
     }
-    memcpy(e->data, src, bytes);
+    return qtrue;
+}
+
+static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
+{
+    if (!SKC_Reserve(e, rc)) {
+        return;
+    }
+    memcpy(e->data, src, rc * (int)SKC_VERT_BYTES);
     e->valid = qtrue;
     s_skcStore++;
 against the old loops, vertex by vertex (counted by r_hzmPerfStats).
@@ -2228,6 +2543,7 @@ typedef struct {
     qboolean           hasMorph;
     byte              *out;
     skcEntry_t        *store;       // third identical sighting: keep the result in the skin cache
+    uint64_t           hash;        // what the entry was keyed to when the job was queued
 } psJob_t;
 
 static psEntry_t s_ps[PS_SLOTS];
@@ -2295,6 +2611,7 @@ extern "C" void R_SkelThreadsShutdown(void)
     }
     s_psFrame = -1;
     s_psNum = s_psNext = s_psPending = 0;
+    R_SkelPoseMemoFlush();      // [render-perf 1] and the kept poses with it
 }
 
 static int PS_WantedWorkers(void)
@@ -2505,7 +2822,7 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
         psEntry_t         *slot;
         skcEntry_t        *skc = NULL;
         int                bytes;
-        uint64_t           hash;
+        uint64_t           hash = 0;
 
         if (*drawSurf->surface != SF_TIKI_SKEL) {
             continue;
@@ -2541,19 +2858,35 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
             }
             if (skc) {
                 s_skcMiss++;
-                if (skc->same >= 2 && skc->hitFrame != tr.frameCount) {
+                // third identical sighting - or [render-perf 1] a model that is small on screen this frame: its pose
+                // is about to be held (THE POSE MEMO), so the very next frames ask for exactly this skin again
+                if ((skc->same >= 2 || PM_IsSmall(ent->e.entityNumber)) && skc->hitFrame != tr.frameCount) {
                     job.store = skc;
                 }
             }
         }
 
-        bytes = (int)((job.rc * SKC_VERT_BYTES + 63) & ~(size_t)63);
-        if (numJobs >= PS_MAX_JOBS || s_psArenaUsed + bytes > PS_ARENA_BYTES) {
+        if (numJobs >= PS_MAX_JOBS) {
             slot->frame = -1;       // give the slot back: RB_SkelMesh skins this one inline
             continue;
         }
-        job.out = s_psArena + s_psArenaUsed;
-        s_psArenaUsed += bytes;
+        if (job.store && SKC_Reserve(job.store, (int)job.rc)) {
+            // [render-perf 1] skinned straight into the cache entry (no copy afterwards). The entry is not valid until
+            // the jobs below are done, and its buffer is on loan to the frame table from now on.
+            job.store->valid    = qfalse;
+            job.store->hitFrame = tr.frameCount;
+            job.out             = job.store->data;
+            job.hash            = hash;
+        } else {
+            job.store = NULL;
+            bytes     = (int)((job.rc * SKC_VERT_BYTES + 63) & ~(size_t)63);
+            if (s_psArenaUsed + bytes > PS_ARENA_BYTES) {
+                slot->frame = -1;
+                continue;
+            }
+            job.out = s_psArena + s_psArenaUsed;
+            s_psArenaUsed += bytes;
+        }
         slot->data = job.out;
         s_psJobs[numJobs++] = job;
     }
@@ -2584,8 +2917,10 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
     }
 
     for (i = 0; i < numJobs; i++) {
-        if (s_psJobs[i].store) {
-            SKC_StoreFrom(s_psJobs[i].store, s_psJobs[i].out, (int)s_psJobs[i].rc);
+        // (not if the entry was re-keyed while the job ran: two entities sharing one entity number)
+        if (s_psJobs[i].store && s_psJobs[i].store->boneHash == s_psJobs[i].hash) {
+            s_psJobs[i].store->valid = qtrue;
+            s_skcStore++;
         }
     }
 }
@@ -2827,7 +3162,8 @@ void RB_SkelMesh(skelSurfaceGame_t *sf)
               (qboolean)(backEnd.currentEntity->e.hasMorph != 0), outXyz, outNormal, tess.texCoords[baseVertex]);
 
     // HZM gl2 [bug-3483] third identical sighting in a row: keep what was just skinned
-    if (skc && skc->same >= 2) {
+    // ([render-perf 1] or at once, for a model whose pose is about to be held)
+    if (skc && (skc->same >= 2 || PM_IsSmall(backEnd.currentEntity->e.entityNumber))) {
         SKC_Store(skc, (int)baseVertex, (int)render_count);
     }
 skc_skinned:
