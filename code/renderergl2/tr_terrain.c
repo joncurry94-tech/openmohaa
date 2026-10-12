@@ -1520,6 +1520,7 @@ void R_TerrainRestart_f(void)
     if (!tr.world || tr.world->numTerraPatches < 0) {
         return;
     }
+    g_terrainMemoGen++;     // HZM gl2 [render-perf 5]
     
     R_TerrainFree();
 
@@ -1543,6 +1544,8 @@ void R_CraterTerrain(const vec3_t pos, const vec3_t dir, float fDepth, float fRa
     float                  fMinHeight, fMaxHeight;
     float                  fMaxOrig;
     vec3_t                 vArcCenter;
+
+    g_terrainMemoGen++;     // HZM gl2 [render-perf 5] heights are about to change: nothing stored matches any more
     float                  fArcRadius;
     float                  fArcSquared;
 

@@ -1752,13 +1752,169 @@ void R_HZM_TerrainLProbe_f(void)
         tag, hRT, hST, hG, nUp, nSun, nLamp);
 }
 
+/*
+=============
+HZM gl2 [render-perf 5] THE TERRAIN PATCH MEMO
+
+RB_DrawTerrainTris rebuilds every vertex stream of every visible terrain patch from the tessellator's linked lists
+each time the patch is drawn: copy the vertices, a face normal and a tangent solve per triangle, a heightmap normal
+(four grid look-ups, some of them in a neighbouring patch), a Gram-Schmidt and two packs per vertex. A patch is
+drawn three or more times a frame (depth pre-pass, colour pass, sun-shadow views), from exactly the same lists, and
+when the camera stands still from the same lists as the frame before.
+
+What the function writes is a pure function of what it reads: the patch's vertex list (position, both texture
+coordinate sets, and for the light grid the geomorph parents and factor), its triangle list, its lightmap placement,
+the patch light direction it was just handed and three switches. All of that is hashed while walking the lists
+once - far cheaper than the work - and when the hash is the one the stored streams were built from, the streams
+are copied. Anything else runs the function as before and stores what it wrote.
+
+The heightmap normals also read the heights of the patch itself and of its neighbours, which are fixed - except
+that a crater (R_CraterTerrain) rewrites them: g_terrainMemoGen is part of the hash and is bumped there, on
+ter_restart and on a map load. One entry per patch, malloc/free, dropped when the map changes.
+
+r_hzmTerrainMemo 0 = off (live). 2 = verify: a patch that would have been copied is built for real as well and the
 two compared bit for bit (counted by r_hzmPerfStats; the differing count has to stay 0).
 =============
 */
+int g_terrainMemoGen = 1;
+
+typedef struct {
+	uint64_t	key;
+	int			nVerts, nIndexes;
+	int			cap;
+	byte		*data;		// xyz[nVerts] (3 floats) | texCoords | lightCoords | normal | tangent | lightdir | indexes (patch-relative)
+} tmEntry_t;
+
+#define TM_VERT_BYTES	(12 + 8 + 8 + 8 + 8 + 8)
+
+static tmEntry_t	*s_tm;
+static int			s_tmCount;
+static world_t		*s_tmWorld;
+static cvar_t		*r_hzmTerrainMemo;
+
+void R_TerrainMemoFlush(void)
+{
+	int i;
+
+	for (i = 0; i < s_tmCount; i++) {
+		if (s_tm[i].data) {
+			free(s_tm[i].data);
+		}
+	}
+	free(s_tm);
+	s_tm = NULL;
+	s_tmCount = 0;
+	s_tmWorld = NULL;
+	g_terrainMemoGen++;
+}
+
+static ID_INLINE uint64_t TM_Mix(uint64_t h, uint64_t w)
+{
+	h ^= w;
+	h *= 0x100000001B3ULL;
+	h ^= h >> 29;
+	return h;
+}
+
+/*
+TM_Key - everything RB_DrawTerrainTris reads for patch p. Leaves each vertex's iVertArray at its position in the
+list (patch-relative), which is what the triangle part of the hash is made of. *pnVerts / *pnIndexes: what the
+function is going to emit.
+*/
+static uint64_t TM_Key(const srfTerrain_t *p, qboolean bLightGrid, int hmNormals, const int16_t *iLightDir, int *pnVerts,
+	int *pnIndexes)
+{
+	uint64_t	h = 0x9E3779B97F4A7C15ULL, w;
+	int			i, n = 0, nIdx = 0;
+	float		f[2];
+
+	w = (uint64_t)(unsigned int)g_terrainMemoGen | ((uint64_t)(bLightGrid ? 1 : 0) << 32) | ((uint64_t)(hmNormals ? 1 : 0) << 33)
+		| ((uint64_t)(p->dlightMap[0] ? 1 : 0) << 34);
+	h = TM_Mix(h, w);
+	memcpy(&w, iLightDir, 8);
+	h = TM_Mix(h, w);
+	if (p->dlightMap[0]) {
+		f[0] = p->lmapStep;
+		f[1] = p->lmapX;
+		memcpy(&w, f, 8);
+		h = TM_Mix(h, w);
+		f[0] = p->lmapY;
+		f[1] = 0.0f;
+		memcpy(&w, f, 8);
+		h = TM_Mix(h, w);
+	}
+	for (i = p->iVertHead; i; i = g_pVert[i].iNext) {
+		terrainVert_t *pv = &g_pVert[i];
+
+		memcpy(&w, &pv->xyz[0], 8);
+		h = TM_Mix(h, w);
+		memcpy(&w, &pv->xyz[2], 4);
+		memcpy((byte *)&w + 4, &pv->texCoords[0][0], 4);
+		h = TM_Mix(h, w);
+		memcpy(&w, &pv->texCoords[0][1], 4);
+		memcpy((byte *)&w + 4, &pv->texCoords[1][0], 4);
+		h = TM_Mix(h, w);
+		w = 0;
+		memcpy(&w, &pv->texCoords[1][1], 4);
+		if (bLightGrid) {
+			memcpy((byte *)&w + 4, &pv->fHzmMorph, 4);
+			h = TM_Mix(h, w);
+			w = (uint64_t)pv->hzmLPar[0] | ((uint64_t)pv->hzmLPar[1] << 8);
+		}
+		h = TM_Mix(h, w);
+		pv->iVertArray = (terraInt)n;
+		n++;
+	}
+	for (i = p->iTriHead; i; i = g_pTris[i].iNext) {
+		if (g_pTris[i].byConstChecks & 4) {
+			w = (uint64_t)g_pVert[g_pTris[i].iPt[0]].iVertArray | ((uint64_t)g_pVert[g_pTris[i].iPt[1]].iVertArray << 16)
+				| ((uint64_t)g_pVert[g_pTris[i].iPt[2]].iVertArray << 32) | ((uint64_t)1 << 48);
+			nIdx += 3;
+		} else {
+			w = 0;
+		}
+		h = TM_Mix(h, w);
+	}
+	*pnVerts = n;
+	*pnIndexes = nIdx;
+	return h;
+}
+
+static tmEntry_t *TM_Entry(const srfTerrain_t *p)
+{
+	int idx;
+
+	if (!tr.world || !tr.world->terraPatches) {
+		return NULL;
+	}
+	if (s_tmWorld != tr.world || s_tmCount != tr.world->numTerraPatches) {
+		R_TerrainMemoFlush();
+		if (tr.world->numTerraPatches <= 0) {
+			return NULL;
+		}
+		s_tm = (tmEntry_t *)calloc(tr.world->numTerraPatches, sizeof(tmEntry_t));
+		if (!s_tm) {
+			return NULL;
+		}
+		s_tmCount = tr.world->numTerraPatches;
+		s_tmWorld = tr.world;
+	}
+	idx = (int)((const cTerraPatchUnpacked_t *)p - tr.world->terraPatches);
+	if (idx < 0 || idx >= s_tmCount || (const void *)&tr.world->terraPatches[idx] != (const void *)p) {
+		return NULL;
+	}
+	return &s_tm[idx];
+}
+
 void RB_DrawTerrainTris(srfTerrain_t* p) {
 	int i;
 	terraInt numv;
 	int dlightBits;
+	// HZM gl2 [render-perf 5] the terrain patch memo
+	tmEntry_t	*tm = NULL;
+	uint64_t	tmKey = 0;
+	int			tmVerts = 0, tmIndexes = 0, firstIndex;
+	qboolean	tmVerify = qfalse;
 	int16_t iNormal[4];
 	int16_t iTangent[4];
 	vec3_t  vUp;
@@ -1840,9 +1996,56 @@ void RB_DrawTerrainTris(srfTerrain_t* p) {
 	}
 
 	firstVert = tess.numVertexes; // remember where this patch's verts start (for the normal pass below)
+	firstIndex = tess.numIndexes;
 
 	dlightBits = p->dlightBits[0];
 	tess.dlightBits |= dlightBits;
+
+	// HZM gl2 [render-perf 5] the same lists as the last time this patch was drawn: copy what was built then
+	if (!r_hzmTerrainMemo) {
+		r_hzmTerrainMemo = ri.Cvar_Get("r_hzmTerrainMemo", "1", 0);
+	}
+	if (r_hzmTerrainMemo->integer && (tm = TM_Entry(p)) != NULL) {
+		static cvar_t *s_tmHmNormals = NULL;
+
+		if (!s_tmHmNormals) {
+			s_tmHmNormals = ri.Cvar_Get("r_hzmTerrainHeightNormals", "1", CVAR_ARCHIVE);
+		}
+		tmKey = TM_Key(p, bLightGrid, s_tmHmNormals->integer, iLightDir, &tmVerts, &tmIndexes);
+		if (tm->data && tm->key == tmKey && tm->nVerts == tmVerts && tm->nIndexes == tmIndexes
+			&& firstVert + tmVerts <= SHADER_MAX_VERTEXES && firstIndex + tmIndexes <= SHADER_MAX_INDEXES
+			&& r_hzmTerrainMemo->integer == 2) {
+			tmVerify = qtrue;	// build it for real below and compare with what is stored
+		} else if (tm->data && tm->key == tmKey && tm->nVerts == tmVerts && tm->nIndexes == tmIndexes
+			&& firstVert + tmVerts <= SHADER_MAX_VERTEXES && firstIndex + tmIndexes <= SHADER_MAX_INDEXES) {
+			const byte *src = tm->data;
+			const glIndex_t *idx;
+
+			for (v = 0; v < tmVerts; v++) {
+				memcpy(tess.xyz[firstVert + v], src + v * 12, 12);
+			}
+			src += tmVerts * 12;
+			memcpy(tess.texCoords[firstVert], src, tmVerts * 8);
+			src += tmVerts * 8;
+			memcpy(tess.lightCoords[firstVert], src, tmVerts * 8);
+			src += tmVerts * 8;
+			memcpy(tess.normal[firstVert], src, tmVerts * 8);
+			src += tmVerts * 8;
+			memcpy(tess.tangent[firstVert], src, tmVerts * 8);
+			src += tmVerts * 8;
+			memcpy(tess.lightdir[firstVert], src, tmVerts * 8);
+			src += tmVerts * 8;
+			memset(tess.color[firstVert], 0xff, tmVerts * 8);
+			idx = (const glIndex_t *)src;
+			for (i = 0; i < tmIndexes; i++) {
+				tess.indexes[firstIndex + i] = (glIndex_t)(firstVert + idx[i]);
+			}
+			tess.numVertexes += tmVerts;
+			tess.numIndexes += tmIndexes;
+			hzmPerf.terrainMemo++;
+			return;
+		}
+	}
 	if (p->dlightMap[0])
 	{
 		float lmScale = (1.0 / LIGHTMAP_SIZE) / p->lmapStep;
@@ -2027,6 +2230,68 @@ void RB_DrawTerrainTris(srfTerrain_t* p) {
 			R_VaoPackTangent(pt, t4);
 			VectorCopy4(pt, tess.tangent[v]);
 		}
+	}
+
+	// HZM gl2 [render-perf 5] keep what was just built
+	if (tmVerify) {
+		const byte		*src = tm->data;
+		const glIndex_t	*idx;
+		qboolean		bad = (qboolean)(tess.numVertexes - firstVert != tmVerts || tess.numIndexes - firstIndex != tmIndexes);
+
+		for (v = 0; v < tmVerts && !bad; v++) {
+			bad = (qboolean)(memcmp(tess.xyz[firstVert + v], src + v * 12, 12) != 0);
+		}
+		if (!bad) {
+			src += tmVerts * 12;
+			bad = (qboolean)(memcmp(tess.texCoords[firstVert], src, tmVerts * 8)
+				|| memcmp(tess.lightCoords[firstVert], src + tmVerts * 8, tmVerts * 8)
+				|| memcmp(tess.normal[firstVert], src + tmVerts * 16, tmVerts * 8)
+				|| memcmp(tess.tangent[firstVert], src + tmVerts * 24, tmVerts * 8)
+				|| memcmp(tess.lightdir[firstVert], src + tmVerts * 32, tmVerts * 8));
+			idx = (const glIndex_t *)(src + tmVerts * 40);
+			for (i = 0; i < tmIndexes && !bad; i++) {
+				bad = (qboolean)(tess.indexes[firstIndex + i] != (glIndex_t)(firstVert + idx[i]));
+			}
+		}
+		hzmPerf.verifyTerrain++;
+		hzmPerf.verifyTerrainBad += bad;
+	}
+	if (tm && tess.numVertexes - firstVert == tmVerts && tess.numIndexes - firstIndex == tmIndexes) {
+		int need = tmVerts * TM_VERT_BYTES + tmIndexes * (int)sizeof(glIndex_t);
+
+		if (need > tm->cap) {
+			free(tm->data);
+			tm->data = (byte *)malloc(need + 256);
+			tm->cap = tm->data ? need + 256 : 0;
+		}
+		if (tm->data) {
+			byte		*dst = tm->data;
+			glIndex_t	*idx;
+
+			for (v = 0; v < tmVerts; v++) {
+				memcpy(dst + v * 12, tess.xyz[firstVert + v], 12);
+			}
+			dst += tmVerts * 12;
+			memcpy(dst, tess.texCoords[firstVert], tmVerts * 8);
+			dst += tmVerts * 8;
+			memcpy(dst, tess.lightCoords[firstVert], tmVerts * 8);
+			dst += tmVerts * 8;
+			memcpy(dst, tess.normal[firstVert], tmVerts * 8);
+			dst += tmVerts * 8;
+			memcpy(dst, tess.tangent[firstVert], tmVerts * 8);
+			dst += tmVerts * 8;
+			memcpy(dst, tess.lightdir[firstVert], tmVerts * 8);
+			dst += tmVerts * 8;
+			idx = (glIndex_t *)dst;
+			for (i = 0; i < tmIndexes; i++) {
+				idx[i] = (glIndex_t)(tess.indexes[firstIndex + i] - firstVert);
+			}
+			tm->key = tmKey;
+			tm->nVerts = tmVerts;
+			tm->nIndexes = tmIndexes;
+		}
+	} else if (tm) {
+		tm->nVerts = -1;	// what was emitted is not what the hash walk counted: never match on it
 	}
 }
 

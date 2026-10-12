@@ -3537,6 +3537,7 @@ void RE_LoadWorldMap( const char *name ) {
 	// different objects and can land inside that window, so clear outright rather than rely on it.
 	R_CoopResetEntityLightSmoothing();
 	R_LightDirCacheFlush();	// HZM gl2 [render-perf 4] and every remembered light direction
+	R_TerrainMemoFlush();	// HZM gl2 [render-perf 5] and every stored terrain patch
 
 	// set default map light scale
 	tr.sunShadowScale = 0.5f;
