@@ -664,6 +664,8 @@ void RB_UpdateTessVao(unsigned int attribBits)
 		qboolean stream = (qboolean)(s_tessStreamVerts > SHADER_MAX_VERTEXES && r_hzmTessStream->integer);
 
 		R_BindVao(tess.vao);
+		hzmPerf.tessBatches++;
+		hzmPerf.tessVerts += tess.numVertexes;
 
 		if (stream && s_tessCursorV + tess.numVertexes <= s_tessStreamVerts
 			&& s_tessCursorI + tess.numIndexes <= s_tessStreamIndexes) {
@@ -702,6 +704,8 @@ void RB_UpdateTessVao(unsigned int attribBits)
 			{
 				// note: tess has a VBO where stride == size
 				qglBufferSubData(GL_ARRAY_BUFFER, vAtb->offset + baseV * vAtb->stride, tess.numVertexes * vAtb->stride, tess.attribPointers[attribIndex]);
+				hzmPerf.tessUploads++;
+				hzmPerf.tessBytes += (double)(tess.numVertexes * vAtb->stride);
 			}
 
 			if (attribBits & attribBit)

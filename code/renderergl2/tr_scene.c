@@ -659,6 +659,9 @@ void RE_RenderScene( const refdef_t *fd ) {
 	}
 
 	startTime = ri.Milliseconds();
+	if ( hzmTiming ) {
+		hzmFrontUs -= R_HzmMicros();	// HZM gl2 [render-perf 0] r_hzmAB: closed at the end of this function
+	}
 
 	if (!tr.world && !( fd->rdflags & RDF_NOWORLDMODEL ) ) {
 		ri.Error (ERR_DROP, "R_RenderScene: NULL worldmodel");
@@ -976,6 +979,9 @@ void RE_RenderScene( const refdef_t *fd ) {
 	RE_EndScene();
 
 	tr.frontEndMsec += ri.Milliseconds() - startTime;
+	if ( hzmTiming ) {
+		hzmFrontUs += R_HzmMicros();	// HZM gl2 [render-perf 0]
+	}
 }
 
 //

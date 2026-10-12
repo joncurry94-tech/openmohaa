@@ -1493,6 +1493,9 @@ static int R_LightDirForPointEx( vec3_t point, vec3_t lightDir, vec3_t normal, w
 	return qtrue;
 }
 
+world and compared bit for bit (counted by r_hzmPerfStats; the differing count has to stay 0).
+===============
+*/
 int R_LightDirForPoint( vec3_t point, vec3_t lightDir, vec3_t normal, world_t *world )
 {
 	return R_LightDirForPointEx( point, lightDir, normal, world, qtrue, NULL );

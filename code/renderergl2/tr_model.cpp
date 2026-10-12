@@ -939,6 +939,166 @@ void RB_DrawSkeletor(trRefEntity_t *ent)
 surfaceType_t skelSurface = SF_TIKI_SKEL;
 
 /*
+=============
+HZM gl2 [render-perf 0] counters behind r_hzmPerfStats 1 (one line every ~2 s, per-frame averages)
+=============
+*/
+#include <chrono>
+
+extern "C" {
+hzmPerf_t hzmPerf;
+qboolean  hzmTiming;
+uint64_t  hzmFrontUs, hzmBackUs;
+}
+
+extern "C" uint64_t R_HzmMicros(void)
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/*
+R_HzmABFrame - [render-perf 0] r_hzmAB "<cvar> <off value> <on value>": a live A/B that the map cannot drift under.
+The named cvar is flipped every AB_BLOCK frames; each frame's wall time (begin-frame to begin-frame) and the
+renderer's own main-thread time in it (front end + back end, the swap excluded) are added to whichever state the
+frame ran in, the first AB_SKIP frames after every flip left out (caches refill). One line every ~2.5 s:
+  ^~^~^ RPAB <cvar> off: frame F ms renderer R ms (n) | on: ... | saved: frame .. renderer ..
+Both states are sampled within half a second of each other all the way through, so what the battle is doing to the
+frame time cancels. Empty string = off; the cvar is left at its ON value when the test is stopped.
+*/
+#define AB_BLOCK 12
+#define AB_SKIP  4
+
+static void R_HzmABFrame(void)
+{
+    static cvar_t  *r_hzmAB;
+    static char     name[64], offVal[32], onVal[32], spec[160];
+    static int      pos, state, lastPrintMs;
+    static uint64_t lastUs;
+    static double   accF[2], accR[2];
+    static int      accN[2];
+    uint64_t        now;
+
+    if (!r_hzmAB) {
+        r_hzmAB = ri.Cvar_Get("r_hzmAB", "", 0);
+    }
+    if (!r_hzmAB->string[0]) {
+        if (spec[0]) {
+            ri.Cvar_Set(name, onVal);
+            spec[0] = 0;
+        }
+        return;
+    }
+    hzmTiming = qtrue;
+    now       = R_HzmMicros();
+    if (strcmp(spec, r_hzmAB->string)) {
+        // a new test
+        if (spec[0]) {
+            ri.Cvar_Set(name, onVal);
+        }
+        Q_strncpyz(spec, r_hzmAB->string, sizeof(spec));
+        name[0] = offVal[0] = onVal[0] = 0;
+        sscanf(spec, "%63s %31s %31s", name, offVal, onVal);
+        if (!name[0] || !offVal[0] || !onVal[0]) {
+            ri.Printf(PRINT_ALL, "r_hzmAB: \"<cvar> <off value> <on value>\"\n");
+            spec[0] = 0;
+            ri.Cvar_Set("r_hzmAB", "");
+            return;
+        }
+        pos = 0;
+        state = 0;
+        accF[0] = accF[1] = accR[0] = accR[1] = 0.0;
+        accN[0] = accN[1] = 0;
+        ri.Cvar_Set(name, offVal);
+        lastUs      = now;
+        hzmFrontUs  = hzmBackUs = 0;
+        lastPrintMs = ri.Milliseconds();
+        return;
+    }
+
+    // the frame that just ended ran in `state`
+    if (pos >= AB_SKIP) {
+        accF[state] += (double)(now - lastUs);
+        accR[state] += (double)(int64_t)(hzmFrontUs + hzmBackUs);
+        accN[state]++;
+    }
+    lastUs     = now;
+    hzmFrontUs = hzmBackUs = 0;
+    if (++pos >= AB_BLOCK) {
+        pos   = 0;
+        state = !state;
+        ri.Cvar_Set(name, state ? onVal : offVal);
+    }
+    if (ri.Milliseconds() - lastPrintMs >= 2500 && accN[0] > 8 && accN[1] > 8) {
+        double f0 = accF[0] / accN[0] / 1000.0, f1 = accF[1] / accN[1] / 1000.0;
+        double r0 = accR[0] / accN[0] / 1000.0, r1 = accR[1] / accN[1] / 1000.0;
+
+        ri.Printf(PRINT_ALL, "^~^~^ RPAB %s off: frame %.3f ms renderer %.3f ms (%d) | on: frame %.3f ms renderer %.3f ms (%d) | "
+                             "saved: frame %.3f renderer %.3f\n",
+                  name, f0, r0, accN[0], f1, r1, accN[1], f0 - f1, r0 - r1);
+        accF[0] = accF[1] = accR[0] = accR[1] = 0.0;
+        accN[0] = accN[1] = 0;
+        lastPrintMs       = ri.Milliseconds();
+    }
+}
+
+extern "C" void R_HzmPerfFrame(void)
+{
+    static cvar_t *r_hzmPerfStats;
+    static int     frames, lastMs;
+    int            now;
+
+    hzmTiming = qfalse;
+    R_HzmABFrame();
+    if (!r_hzmPerfStats) {
+        r_hzmPerfStats = ri.Cvar_Get("r_hzmPerfStats", "0", 0);
+    }
+    if (!r_hzmPerfStats->integer) {
+        frames = 0;
+        return;
+    }
+    if (!frames) {
+        memset(&hzmPerf, 0, sizeof(hzmPerf));
+        lastMs = ri.Milliseconds();
+    }
+    frames++;
+    {
+        int glErr = (int)qglGetError();
+
+        if (glErr != GL_NO_ERROR) {
+            hzmPerf.glErrors++;
+            hzmPerf.glLastError = glErr;
+        }
+    }
+    now = ri.Milliseconds();
+    if (now - lastMs >= 2000) {
+        float f = 1.0f / frames;
+        ri.Printf(PRINT_ALL,
+            "^~^~^ RPSTAT frames=%d skel adds=%.0f posed=%.0f exact=%.0f hold=%.0f | tess batches=%.0f uploads=%.0f verts=%.0f "
+            "KB=%.0f stalls=%d | sprites=%.0f batches=%.0f | light fills=%.0f | static surfs=%.0f terrain=%.0f memo=%.0f\n",
+            frames, hzmPerf.skelAdds * f, hzmPerf.skelPosed * f, hzmPerf.skelExact * f, hzmPerf.skelHold * f,
+            hzmPerf.tessBatches * f, hzmPerf.tessUploads * f, hzmPerf.tessVerts * f, (float)(hzmPerf.tessBytes * f / 1024.0),
+            hzmPerf.tessStalls,
+            hzmPerf.sprites * f, hzmPerf.spriteBatches * f, hzmPerf.lightFills * f,
+            hzmPerf.staticSurfs * f, hzmPerf.terrainPatches * f, hzmPerf.terrainMemo * f);
+        if (hzmPerf.verifyPose || hzmPerf.verifyLightDir || hzmPerf.verifyTerrain || hzmPerf.verifyPack) {
+            ri.Printf(PRINT_ALL, "^~^~^ RPSTAT4 verify (checked/DIFFERENT) pose %d/%d lightdir %d/%d terrain %d/%d pack %d/%d\n",
+                      hzmPerf.verifyPose, hzmPerf.verifyPoseBad, hzmPerf.verifyLightDir, hzmPerf.verifyLightDirBad,
+                      hzmPerf.verifyTerrain, hzmPerf.verifyTerrainBad, hzmPerf.verifyPack, hzmPerf.verifyPackBad);
+        }
+        ri.Printf(PRINT_ALL, "^~^~^ RPSTAT3 gl draws=%.0f uniforms=%.0f matrix uniforms=%.0f program binds=%.0f texture binds=%.0f "
+                             "| GLERRORS=%d (last 0x%x)\n",
+            hzmPerf.glDraws * f, hzmPerf.glUniforms * f, hzmPerf.glUniformMats * f, hzmPerf.glPrograms * f, hzmPerf.glTexBinds * f,
+            hzmPerf.glErrors, hzmPerf.glLastError);
+        memset(&hzmPerf, 0, sizeof(hzmPerf));
+        frames = 0;
+    }
+}
+
+(r_hzmPerfStats 1 prints the count checked and the count that differed, which has to stay 0).
+=============
+*/
 ==============
 R_AddSkelSurfaces
 ==============
@@ -1778,6 +1938,9 @@ static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
     memcpy(e->data, src, bytes);
     e->valid = qtrue;
     s_skcStore++;
+against the old loops, vertex by vertex (counted by r_hzmPerfStats).
+
+Static models: a surface's normals, texture and lightmap coordinates never change, so they are packed / split once
 }
 
 /*
@@ -2930,6 +3093,7 @@ void RB_StaticMesh(staticSurface_t *staticSurf)
         tess.numIndexes += j;
     }
 
+    hzmPerf.staticSurfs++;
     for (j = 0; j < render_count; j++) {
         Vector4Copy(surf->pStaticXyz[j], tess.xyz[baseVertex + j]);
         // HZM gl2 re-port (bug-gl2-modellight): pStaticNormal is float, gl2's

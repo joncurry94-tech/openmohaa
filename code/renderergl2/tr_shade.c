@@ -41,6 +41,7 @@ R_DrawElements
 
 void R_DrawElements( int numIndexes, int firstIndex )
 {
+	hzmPerf.glDraws++;	// HZM gl2 [render-perf 0] r_hzmPerfStats
 	if (tess.useCacheVao)
 	{
 		VaoCache_DrawElements(numIndexes, firstIndex);
@@ -2789,6 +2790,7 @@ static void RB_FillModelLightingColors( void )
 		return;
 	}
 
+	hzmPerf.lightFills++;	// HZM gl2 [render-perf 0] r_hzmPerfStats
 	backEnd.currentSphere->TessFunction(&lightColors[0][0]);
 
 	for (i = 0; i < tess.numVertexes; i++) {

@@ -2733,8 +2733,12 @@ RB_ExecuteRenderCommands
 */
 void RB_ExecuteRenderCommands( const void *data ) {
 	int		t1, t2;
+	qboolean	hzmTimed = hzmTiming;	// HZM gl2 [render-perf 0] r_hzmAB: this function's time, the swap excluded
 
 	t1 = ri.Milliseconds ();
+	if ( hzmTimed ) {
+		hzmBackUs -= R_HzmMicros();
+	}
 
 	while ( 1 ) {
 		data = PADP(data, sizeof(void *));
@@ -2753,7 +2757,13 @@ void RB_ExecuteRenderCommands( const void *data ) {
 			data = RB_DrawBuffer( data );
 			break;
 		case RC_SWAP_BUFFERS:
+			if ( hzmTimed ) {
+				hzmBackUs += R_HzmMicros();
+			}
 			data = RB_SwapBuffers( data );
+			if ( hzmTimed ) {
+				hzmBackUs -= R_HzmMicros();
+			}
 			break;
 		case RC_SCREENSHOT:
 			data = RB_TakeScreenshotCmd( data );
@@ -2792,6 +2802,9 @@ void RB_ExecuteRenderCommands( const void *data ) {
 			// stop rendering
 			t2 = ri.Milliseconds ();
 			backEnd.pc.msec = t2 - t1;
+			if ( hzmTimed ) {
+				hzmBackUs += R_HzmMicros();
+			}
 			return;
 		}
 	}
@@ -2910,6 +2923,7 @@ void RB_RenderSpriteSurfList(drawSurf_t* drawSurfs, int numDrawSurfs) {
 
 	backEnd.pc.c_surfaces += numDrawSurfs;
 	backEnd.or = backEnd.viewParms.world;
+	hzmPerf.sprites += numDrawSurfs;
 
 	// HZM gl2 SOFT PARTICLES (r_softParticles): open the per-fragment fade window for the sprite
 	// list and bind the scene-depth snapshot on TB_SCREENDEPTH. spriteDepthHack is set per sprite
@@ -2934,6 +2948,7 @@ void RB_RenderSpriteSurfList(drawSurf_t* drawSurfs, int numDrawSurfs) {
 
             RB_BeginSurface(shader, 0, 0);
             oldShader = shader;
+			hzmPerf.spriteBatches++;
         }
 
 		// HZM gl2 SOFT PARTICLES: record this sprite's depth-hack state for RB_SetSoftParticleUniforms.

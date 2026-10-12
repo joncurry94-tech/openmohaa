@@ -73,6 +73,7 @@ int GL_BindMultiTexture(GLenum texunit, GLenum target, GLuint texture)
 
 	qglBindMultiTextureEXT(texunit, target, texture);
 	glDsaState.textures[tmu] = texture;
+	hzmPerf.glTexBinds++;	// HZM gl2 [render-perf 0] r_hzmPerfStats
 	return 1;
 }
 
@@ -154,6 +155,7 @@ int GL_UseProgram(GLuint program)
 
 	qglUseProgram(program);
 	glDsaState.program = program;
+	hzmPerf.glPrograms++;	// HZM gl2 [render-perf 0] r_hzmPerfStats
 	return 1;
 }
 

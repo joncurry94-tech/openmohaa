@@ -1752,6 +1752,9 @@ void R_HZM_TerrainLProbe_f(void)
         tag, hRT, hST, hG, nUp, nSun, nLamp);
 }
 
+two compared bit for bit (counted by r_hzmPerfStats; the differing count has to stay 0).
+=============
+*/
 void RB_DrawTerrainTris(srfTerrain_t* p) {
 	int i;
 	terraInt numv;
@@ -1767,6 +1770,7 @@ void RB_DrawTerrainTris(srfTerrain_t* p) {
 	static vec3_t s_terraBitanAcc[SHADER_MAX_VERTEXES];
 
 	RB_CHECKOVERFLOW(p->nVerts, p->nTris * 3);
+	hzmPerf.terrainPatches++;
 
 	// HZM coop - gl2 tess.normal/tangent are PACKED int16[4] (not float like gl1). The port set neither
 	// correctly for terrain: the float "1.0" normal stored as int16 1 = a near-zero normal, and the tangent

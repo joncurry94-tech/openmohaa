@@ -4641,6 +4641,26 @@ qboolean R_TessStreamDraw(int numIndexes, int firstIndex);
 // HZM gl2 [bug-3487] skinning on worker threads (tr_model.cpp)
 void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs);
 void R_SkelThreadsShutdown(void);
+// HZM gl2 [render-perf 0] counters behind r_hzmPerfStats (tr_model.cpp R_HzmPerfFrame: one line every ~2 s)
+typedef struct {
+	int skelAdds, skelPosed, skelExact, skelHold;
+	int tessBatches, tessUploads, tessVerts, tessStalls;
+	double tessBytes;
+	int sprites, spriteBatches;
+	int lightFills;
+	int staticSurfs, terrainPatches, terrainMemo;
+	int glDraws, glUniforms, glUniformMats, glPrograms, glTexBinds;
+	int glErrors, glLastError;	// polled once a frame while r_hzmPerfStats is on (the engine itself only looks when it creates something)
+	// the memos' verify modes: answers checked against the real work / answers that differed (must stay 0)
+	int verifyPose, verifyPoseBad, verifyLightDir, verifyLightDirBad, verifyTerrain, verifyTerrainBad, verifyPack, verifyPackBad;
+} hzmPerf_t;
+extern hzmPerf_t hzmPerf;
+void R_HzmPerfFrame(void);
+// [render-perf 0] the renderer's own main-thread time, for r_hzmAB: microseconds since some fixed point, and the
+// accumulators the front end (RE_RenderScene) and the back end (RB_ExecuteRenderCommands, the swap excluded) add to
+uint64_t R_HzmMicros(void);
+extern qboolean hzmTiming;			// someone is listening: take the timestamps
+extern uint64_t hzmFrontUs, hzmBackUs;
 extern hzmDrawBuffers_t          qglDrawBuffers;            // GL 2.0; NULL = no MRT colour resolve (blit fallback)
 extern hzmBindFragDataLocation_t qglBindFragDataLocation;   // GL 3.0; NULL = no MRT colour resolve (blit fallback)
 qboolean    R_MsaaResolvesActive(void);

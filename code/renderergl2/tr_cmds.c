@@ -370,6 +370,7 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 
 	tr.frameCount++;
 	tr.frameSceneNum = 0;
+	R_HzmPerfFrame();	// HZM gl2 [render-perf 0] r_hzmPerfStats
 
 	// HZM gl2 MSAA (plan P2a): apply r_msaaBypass (the HOME key, live) - new path at >= 2 samples only
 	R_MsaaBeginFrame();
