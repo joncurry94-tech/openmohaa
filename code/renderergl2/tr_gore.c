@@ -17,6 +17,10 @@ byte-identical; only the renderer bridge points differ:
    the glGetTexImage readback rebinds raw on unit 0 and then resets the whole
    cache with GL_BindNullTextures.
  - the instance image slot is created with gl2's R_CreateImage.
+ - r_goreGpu (default 1): step 3 is done on the GPU - the instance texture is an FBO
+   target, the base is drawn into it and each stamp is a quad whose fragment shader is the
+   CPU compositor's loop body. Nothing is read back. See "GPU COMPOSITOR" below; the CPU
+   path (r_goreGpu 0) is kept whole, as the reference and as the fallback.
 
 How it works, end to end:
  1. cgame forwards every server-authoritative bullet segment (trace start ->
@@ -138,6 +142,10 @@ typedef struct goreInstance_s {
     byte    *pixels;        // CPU RGBA working copy (ri.Malloc)
     int      width, height; // dimensions of pixels / instImage upload
     int      fullWidth;     // [bug-3493] width of the base image itself; width may be a smaller mip of it
+    // GPU compositor (r_goreGpu): qtrue = instImage is painted through an FBO and `pixels` is NULL (or, with
+    // r_goreGpu 2, a CPU reference copy that every pass is compared against). qfalse = the CPU path.
+    qboolean gpu;
+    int      texW, texH;    // storage instImage's level 0 was last given (a property of the SLOT: survives a free)
     int      lastUseFrame;  // LRU (tr.frameCount at last bind/stamp)
     // bug-754: skin-flip migration
     char           family[MAX_QPATH];         // baseImage name minus extension + _bloodN suffix
@@ -201,6 +209,11 @@ static qboolean s_stampTried;
 // wound + the killing-blow corpse splashes. Same load-or-fallback pattern as the stamp.
 static byte *s_splashPix;
 static int   s_splashW, s_splashH;
+
+// GPU compositor (r_goreGpu): the two art layers also live in GL textures; set whenever the CPU art was (re)loaded
+static qboolean s_goreArtDirty;
+static cvar_t  *r_goreGpu;
+static int      s_goreMode = -1; // r_goreGpu value the live instances were built under (-1 = none built yet)
 
 // bug-780: killing-blow splash flags per entity (ri.Milliseconds when flagged, 0 = none).
 // Set by cgame on the EF_DEAD rising edge, consumed end-of-frame in R_GoreCommitPending.
@@ -417,6 +430,7 @@ static void R_GoreFreeInstance(goreInstance_t *inst)
         inst->inuse = qfalse;
         s_goreActiveCount--;
     }
+    inst->gpu          = qfalse;
     inst->entityNumber = -1;
     inst->baseImage    = NULL;
     inst->rebaseImage  = NULL;
@@ -1149,7 +1163,8 @@ static void R_GoreLoadStamp(void)
     if (s_stampTried) {
         return;
     }
-    s_stampTried = qtrue;
+    s_stampTried   = qtrue;
+    s_goreArtDirty = qtrue; // the GPU compositor's copies of the two layers are stale now
 
     // R_LoadImage silently prefers a same-name .dds when S3TC is on and would
     // hand us COMPRESSED bytes (no format info from this API) - if anything
@@ -1279,6 +1294,844 @@ static void R_GoreLoadStamp(void)
 }
 
 /*
+=============================================================================
+GPU COMPOSITOR (r_goreGpu)                      [user 2026-10-11, bug-3493 "the full fix"]
+
+The CPU path gives every wounded body part a private RGBA copy of its diffuse: read the whole texture back from
+the GPU, composite into the copy, upload it. On an HD skin (2048x2048 = 16 MB) that readback alone is ~31 ms, and
+it was 52 % of every slow frame of a firefight. Here nothing ever leaves the GPU:
+
+  base   the instance texture is an FBO colour attachment; one quad copies the base diffuse into it, texel for
+         texel (texelFetch - compressed textures cannot be attached or glCopyImageSubData'd into RGBA8, and
+         sampling is exactly what every unwounded soldier's skin goes through anyway).
+  stamp  one quad per art layer, covering exactly the texels R_GoreStampLayer's loop visits. The fragment shader
+         IS that loop body: the same inverse rotation into art space, the same truncating nearest sample, the same
+         integer blend (dst*(255-a) + src*a)/255 with the destination alpha kept. The destination is read from a
+         scratch copy of the rectangle (blitted just before the draw), so there is no feedback loop and no
+         reliance on fixed-function blending (which rounds where the CPU truncates).
+  wrap   a stamp that crosses a texture edge is drawn once per tile it touches, in the CPU loop's order
+         (rows outer, columns inner), so even a stamp larger than the texture overlaps itself the same way.
+  rebase / replay   redraw the new base, then draw the recorded stamps again.
+
+All of the wound LOGIC (what gets stamped, where, how big, which instance is stolen) is the code below, shared by
+both paths; only "write these texels" differs. r_goreGpu: 0 = CPU path (unchanged, and the fallback whenever the
+GL features are missing or the base is an sRGB texture), 1 = GPU, 2 = GPU plus a CPU reference copy that every
+pass is read back and compared against (a test mode: it brings the readbacks back). Changing the cvar rebuilds
+the live instances from their stamp records in the other mode, which is what makes same-frame A/B stills possible.
+
+GL state: R_GoreCommitPending runs from RE_EndFrame after the back end has swapped. Everything goes through the
+caches the renderer keeps (tr_dsa.c for textures / program / framebuffers, GL_State, GL_Cull); what has no cache
+(viewport, scissor box and enable, dither, colour mask, vertex array) is saved in R_GoreGpuBegin and put back in
+R_GoreGpuEnd. The FBOs, programs and the vertex array are this file's own raw GL objects (deleted in
+R_GoreShutdown); the textures are ordinary image_t slots so R_DeleteTextures owns them.
+=============================================================================
+*/
+#define GORE_GPU_SCRATCH 1024 // side of the scratch copy; larger stamp rectangles are drawn in chunks
+
+typedef struct {
+    qboolean tried, ok;
+    qboolean precise;                // the stamp shader carries GLSL 4 `precise` (no fused multiply-add)
+    GLuint   fboInst, fboScratch, vao;
+    GLuint   progBase, progStamp;
+    GLint    uBaseP, uStampOrg, uStampRot, uStampArt;
+    image_t *scratch;
+    image_t *art[2];                 // 0 = bullet-hole stamp, 1 = blood splash
+    GLuint   attached;               // texture currently on fboInst's colour attachment
+    // state bracket
+    qboolean  active;
+    GLint     vp[4], sc[4];
+    GLboolean scOn, dither, mask[4];
+    uint32_t  stateBits;
+    int       cull;
+    FBO_t    *fbo;
+    vao_t    *oldVao;
+    // counters (r_goreDebug)
+    int draws, blits, fills, glErrors, preErrors;
+    int vChecks, vBadTexels, vMaxDiff, vBaseBadTexels, vBaseMaxDiff;
+} goreGpu_t;
+
+static goreGpu_t s_gg;
+
+static const char *s_goreGpuVS =
+    "void main()\n"
+    "{\n"
+    "	vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));\n"
+    "	gl_Position = vec4(c * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+// the viewport is the target rectangle, so gl_FragCoord is the destination texel (+0.5)
+static const char *s_goreGpuBaseFS =
+    "uniform sampler2D u_Tex;\n"
+    "uniform vec4 u_P;\n" // x = mip level
+    "out vec4 out_Color;\n"
+    "void main()\n"
+    "{\n"
+    "	out_Color = texelFetch(u_Tex, ivec2(gl_FragCoord.xy), int(u_P.x));\n"
+    "}\n";
+
+// R_GoreStampLayer's loop body. u_Org.xy = the stamp centre in this tile's texel coordinates, u_Org.zw = the
+// origin of the rectangle held in u_Dst; u_Rot = cos, sin, art texels per destination texel; u_ArtSize = w, h.
+static const char *s_goreGpuStampFS =
+    "uniform sampler2D u_Dst;\n"
+    "uniform sampler2D u_Art;\n"
+    "uniform vec4 u_Org;\n"
+    "uniform vec4 u_Rot;\n"
+    "uniform vec4 u_ArtSize;\n"
+    "out vec4 out_Color;\n"
+    "void main()\n"
+    "{\n"
+    "	ivec2 t = ivec2(gl_FragCoord.xy);\n"
+    "	float dx = float(t.x - int(u_Org.x));\n"
+    "	float dy = float(t.y - int(u_Org.y));\n"
+    "	GORE_PRECISE float fx = (dx * u_Rot.x - dy * u_Rot.y) * u_Rot.z + u_ArtSize.x * 0.5;\n"
+    "	GORE_PRECISE float fy = (dx * u_Rot.y + dy * u_Rot.x) * u_Rot.z + u_ArtSize.y * 0.5;\n"
+    "	ivec2 s = ivec2(int(fx), int(fy));\n"
+    "	if (s.x < 0 || s.y < 0 || s.x >= int(u_ArtSize.x) || s.y >= int(u_ArtSize.y)) discard;\n"
+    "	ivec4 a = ivec4(texelFetch(u_Art, s, 0) * 255.0 + 0.5);\n"
+    "	if (a.a == 0) discard;\n"
+    "	vec4 d = texelFetch(u_Dst, t - ivec2(int(u_Org.z), int(u_Org.w)), 0);\n"
+    "	ivec3 di = ivec3(d.rgb * 255.0 + 0.5);\n"
+    "	ivec3 o = (di * (255 - a.a) + a.rgb * a.a) / 255;\n"
+    "	out_Color = vec4(vec3(o) / 255.0, d.a);\n"
+    "}\n";
+
+static GLuint R_GoreGpuCompile(GLenum type, const char *header, const char *body, qboolean quiet)
+{
+    const GLchar *src[2];
+    GLuint        sh;
+    GLint         okay = 0;
+
+    sh = qglCreateShader(type);
+    if (!sh) {
+        return 0;
+    }
+    src[0] = header;
+    src[1] = body;
+    qglShaderSource(sh, 2, src, NULL);
+    qglCompileShader(sh);
+    qglGetShaderiv(sh, GL_COMPILE_STATUS, &okay);
+    if (!okay) {
+        char log[1024];
+
+        log[0] = 0;
+        qglGetShaderInfoLog(sh, sizeof(log) - 1, NULL, log);
+        log[sizeof(log) - 1] = 0;
+        if (!quiet) {
+            ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: shader compile failed (%s): %s\n", header, log);
+        }
+        qglDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static GLuint R_GoreGpuLink(const char *header, const char *fsBody, qboolean quiet)
+{
+    GLuint vs, fs, prog;
+    GLint  okay = 0;
+
+    vs = R_GoreGpuCompile(GL_VERTEX_SHADER, header, s_goreGpuVS, quiet);
+    if (!vs) {
+        return 0;
+    }
+    fs = R_GoreGpuCompile(GL_FRAGMENT_SHADER, header, fsBody, quiet);
+    if (!fs) {
+        qglDeleteShader(vs);
+        return 0;
+    }
+    prog = qglCreateProgram();
+    qglAttachShader(prog, vs);
+    qglAttachShader(prog, fs);
+    qglLinkProgram(prog);
+    qglGetProgramiv(prog, GL_LINK_STATUS, &okay);
+    qglDetachShader(prog, vs);
+    qglDetachShader(prog, fs);
+    qglDeleteShader(vs);
+    qglDeleteShader(fs);
+    if (!okay) {
+        char log[1024];
+
+        log[0] = 0;
+        qglGetProgramInfoLog(prog, sizeof(log) - 1, NULL, log);
+        log[sizeof(log) - 1] = 0;
+        ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: program link failed: %s\n", log);
+        qglDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+/*
+================
+R_GoreGpuBegin / R_GoreGpuEnd
+
+The state bracket: the first GPU pass of a commit opens it, the end of R_GoreCommitPending closes it.
+================
+*/
+static void R_GoreGpuBegin(void)
+{
+    if (s_gg.active) {
+        return;
+    }
+    s_gg.active = qtrue;
+
+    if (r_goreDebug && r_goreDebug->integer) {
+        // whatever is in the error queue now is not ours - count it apart
+        int guard = 0;
+
+        while (qglGetError() != GL_NO_ERROR && guard++ < 16) {
+            s_gg.preErrors++;
+        }
+    }
+
+    qglGetIntegerv(GL_VIEWPORT, s_gg.vp);
+    qglGetIntegerv(GL_SCISSOR_BOX, s_gg.sc);
+    qglGetBooleanv(GL_SCISSOR_TEST, &s_gg.scOn);
+    qglGetBooleanv(GL_DITHER, &s_gg.dither);
+    qglGetBooleanv(GL_COLOR_WRITEMASK, s_gg.mask);
+    s_gg.stateBits = glState.glStateBits;
+    s_gg.cull      = glState.faceCulling;
+    s_gg.fbo       = glState.currentFBO;
+    s_gg.oldVao    = glState.currentVao;
+
+    qglDisable(GL_SCISSOR_TEST); // it clips both draws and blits
+    qglDisable(GL_DITHER);
+    qglColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    GL_State(GLS_DEPTHTEST_DISABLE); // no depth test or write, no blend, filled polygons
+    GL_Cull(CT_TWO_SIDED);
+}
+
+static void R_GoreGpuEnd(void)
+{
+    if (!s_gg.active) {
+        return;
+    }
+    s_gg.active = qfalse;
+
+    GL_BindFramebuffer(GL_FRAMEBUFFER, s_gg.fbo ? s_gg.fbo->frameBuffer : 0);
+    qglViewport(s_gg.vp[0], s_gg.vp[1], s_gg.vp[2], s_gg.vp[3]);
+    qglScissor(s_gg.sc[0], s_gg.sc[1], s_gg.sc[2], s_gg.sc[3]);
+    if (s_gg.scOn) {
+        qglEnable(GL_SCISSOR_TEST);
+    }
+    if (s_gg.dither) {
+        qglEnable(GL_DITHER);
+    }
+    qglColorMask(s_gg.mask[0], s_gg.mask[1], s_gg.mask[2], s_gg.mask[3]);
+    GL_State(s_gg.stateBits);
+    GL_Cull(s_gg.cull);
+    GL_BindNullProgram();
+
+    // the vertex array: what R_BindVao does for the array the renderer believes is bound
+    qglBindVertexArray(s_gg.oldVao ? s_gg.oldVao->vao : 0);
+    if (s_gg.oldVao && (glRefConfig.intelGraphics || s_gg.oldVao == tess.vao)) {
+        qglBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_gg.oldVao->indexesIBO);
+    }
+
+    if (r_goreDebug && r_goreDebug->integer) {
+        int err, guard = 0;
+
+        while ((err = qglGetError()) != GL_NO_ERROR && guard++ < 16) {
+            s_gg.glErrors++;
+            ri.Printf(PRINT_ALL, "^~^~^ GORE gpu GL ERROR 0x%x after the gore passes\n", err);
+        }
+        ri.Printf(
+            PRINT_ALL, "^~^~^ GORE gpu frame %d: totals fills %d draws %d blits %d, GL errors %d (before our passes %d)\n",
+            tr.frameCount, s_gg.fills, s_gg.draws, s_gg.blits, s_gg.glErrors, s_gg.preErrors
+        );
+    }
+}
+
+/*
+================
+R_GoreGpuInit
+
+Lazily build the programs, the two framebuffers, the vertex array and the scratch / art texture slots.
+Returns qfalse (for good, until the renderer restarts) when the GL features are missing - the CPU path then
+does the work exactly as before.
+================
+*/
+static qboolean R_GoreGpuInit(void)
+{
+    static byte dummy[16 * 16 * 4];
+    const char *why = NULL;
+    int         maj = glRefConfig.glslMajorVersion, min = glRefConfig.glslMinorVersion;
+    int         i;
+
+    if (s_gg.tried) {
+        return s_gg.ok;
+    }
+    s_gg.tried = qtrue;
+    s_gg.ok    = qfalse;
+
+    if (qglesMajorVersion) {
+        why = "OpenGL ES";
+    } else if (!glRefConfig.framebufferObject || !glRefConfig.framebufferBlit) {
+        why = "no framebuffer objects / blit";
+    } else if (!glRefConfig.vertexArrayObject) {
+        why = "no vertex array objects";
+    } else if (maj < 1 || (maj == 1 && min < 30)) {
+        why = "GLSL older than 1.30";
+    }
+    if (why) {
+        ri.Printf(PRINT_ALL, "^~^~^ GORE gpu: unavailable (%s) - using the CPU compositor\n", why);
+        return qfalse;
+    }
+
+    R_GoreGpuBegin();
+
+    // `precise` (GLSL 4.00, or GL_ARB_gpu_shader5 on a 1.50 context): the art-space coordinates are then computed
+    // with the CPU's exact sequence of float operations (no fused multiply-add), so the nearest sample can never
+    // land one art texel aside. Without it the shader still compiles; r_goreGpu 2 measures what that costs.
+    if (maj >= 4) {
+        s_gg.progStamp = R_GoreGpuLink("#version 400\n#define GORE_PRECISE precise\n", s_goreGpuStampFS, qtrue);
+    }
+    if (!s_gg.progStamp && (maj > 1 || min >= 50)) {
+        s_gg.progStamp = R_GoreGpuLink(
+            "#version 150\n#extension GL_ARB_gpu_shader5 : require\n#define GORE_PRECISE precise\n", s_goreGpuStampFS,
+            qtrue
+        );
+    }
+    s_gg.precise = s_gg.progStamp != 0;
+    {
+        const char *hdr = (maj > 1 || min >= 50) ? "#version 150\n#define GORE_PRECISE\n" : "#version 130\n#define GORE_PRECISE\n";
+
+        if (!s_gg.progStamp) {
+            s_gg.progStamp = R_GoreGpuLink(hdr, s_goreGpuStampFS, qfalse);
+        }
+        s_gg.progBase = R_GoreGpuLink(hdr, s_goreGpuBaseFS, qfalse);
+    }
+    if (!s_gg.progStamp || !s_gg.progBase) {
+        ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: unavailable (shaders) - using the CPU compositor\n");
+        return qfalse;
+    }
+
+    GL_UseProgram(s_gg.progBase);
+    qglUniform1i(qglGetUniformLocation(s_gg.progBase, "u_Tex"), 0);
+    s_gg.uBaseP = qglGetUniformLocation(s_gg.progBase, "u_P");
+    GL_UseProgram(s_gg.progStamp);
+    qglUniform1i(qglGetUniformLocation(s_gg.progStamp, "u_Dst"), 0);
+    qglUniform1i(qglGetUniformLocation(s_gg.progStamp, "u_Art"), 1);
+    s_gg.uStampOrg = qglGetUniformLocation(s_gg.progStamp, "u_Org");
+    s_gg.uStampRot = qglGetUniformLocation(s_gg.progStamp, "u_Rot");
+    s_gg.uStampArt = qglGetUniformLocation(s_gg.progStamp, "u_ArtSize");
+
+    qglGenVertexArrays(1, &s_gg.vao); // no attributes: the quad comes from gl_VertexID
+    qglGenFramebuffers(1, &s_gg.fboInst);
+    qglGenFramebuffers(1, &s_gg.fboScratch);
+
+    // texture slots (image_t so R_DeleteTextures owns them; level 0 is respecified below / on art load)
+    s_gg.scratch = R_CreateImage("*goreScratch", dummy, 16, 16, IMGTYPE_COLORALPHA, IMGFLAG_NONE, 0);
+    s_gg.art[0]  = R_CreateImage("*goreArt0", dummy, 16, 16, IMGTYPE_COLORALPHA, IMGFLAG_NONE, 0);
+    s_gg.art[1]  = R_CreateImage("*goreArt1", dummy, 16, 16, IMGTYPE_COLORALPHA, IMGFLAG_NONE, 0);
+    if (!s_gg.vao || !s_gg.fboInst || !s_gg.fboScratch || !s_gg.scratch || !s_gg.art[0] || !s_gg.art[1]) {
+        ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: unavailable (GL objects) - using the CPU compositor\n");
+        return qfalse;
+    }
+    s_gg.scratch->r_sequence = -1;
+    for (i = 0; i < 2; i++) {
+        s_gg.art[i]->r_sequence = -1;
+    }
+    s_goreArtDirty = qtrue;
+
+    {
+        GLuint tex = s_gg.scratch->texnum;
+
+        qglTextureImage2DEXT(
+            tex, GL_TEXTURE_2D, 0, GL_RGBA8, GORE_GPU_SCRATCH, GORE_GPU_SCRATCH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL
+        );
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        s_gg.scratch->width = s_gg.scratch->uploadWidth = GORE_GPU_SCRATCH;
+        s_gg.scratch->height = s_gg.scratch->uploadHeight = GORE_GPU_SCRATCH;
+
+        GL_BindFramebuffer(GL_FRAMEBUFFER, s_gg.fboScratch);
+        qglFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        if (qglCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: unavailable (scratch framebuffer incomplete) - using the CPU compositor\n");
+            return qfalse;
+        }
+    }
+
+    s_gg.ok = qtrue;
+    ri.Printf(
+        PRINT_ALL, "^~^~^ GORE gpu: compositor ready (GLSL %d.%02d, stamp maths %s)\n", maj, min,
+        s_gg.precise ? "precise" : "not marked precise"
+    );
+    return qtrue;
+}
+
+static qboolean R_GoreImageIsSRGB(const image_t *img)
+{
+    switch (img->internalFormat) {
+    case GL_SRGB_EXT:
+    case GL_SRGB8_EXT:
+    case GL_SRGB_ALPHA_EXT:
+    case GL_SRGB8_ALPHA8_EXT:
+    case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
+    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
+    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
+    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
+    case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB:
+        return qtrue;
+    default:
+        return qfalse;
+    }
+}
+
+/*
+================
+R_GoreGpuReady
+
+Should (and can) an instance of this base image be composited on the GPU?  An sRGB base stays on the CPU path:
+sampling would linearise it, the readback does not, and the picture must not depend on the path.
+================
+*/
+static qboolean R_GoreGpuReady(const image_t *img)
+{
+    if (!r_goreGpu || r_goreGpu->integer <= 0) {
+        return qfalse;
+    }
+    if (!R_GoreGpuInit()) {
+        return qfalse;
+    }
+    if (!img || R_GoreImageIsSRGB(img)) {
+        return qfalse;
+    }
+    return qtrue;
+}
+
+// make the instance texture the render target (fboInst is left bound to GL_FRAMEBUFFER)
+static qboolean R_GoreGpuTarget(goreInstance_t *inst)
+{
+    GLuint tex = inst->instImage->texnum;
+
+    GL_BindFramebuffer(GL_FRAMEBUFFER, s_gg.fboInst);
+    if (s_gg.attached != tex) {
+        qglFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        s_gg.attached = tex;
+        if (qglCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            ri.Printf(PRINT_WARNING, "^~^~^ GORE gpu: instance framebuffer incomplete - back to the CPU compositor\n");
+            s_gg.attached = 0;
+            s_gg.ok       = qfalse;
+            return qfalse;
+        }
+    }
+    return qtrue;
+}
+
+/*
+================
+R_GoreGpuBase
+
+Give the instance texture its storage (only when the size changed - the slot is reused) and copy level `level`
+of the base diffuse into it, texel for texel.
+================
+*/
+static qboolean R_GoreGpuBase(goreInstance_t *inst, image_t *img, int w, int h, int level)
+{
+    GLuint tex   = inst->instImage->texnum;
+    float  wrapS = (img->flags & IMGFLAG_CLAMPTOEDGE) ? (float)GL_CLAMP_TO_EDGE : (float)GL_REPEAT;
+
+    R_GoreGpuBegin();
+
+    if (inst->texW != w || inst->texH != h) {
+        qglTextureImage2DEXT(tex, GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        inst->texW    = w;
+        inst->texH    = h;
+        s_gg.attached = 0; // the attachment must be looked at again
+    }
+    qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+    qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapS);
+
+    if (!R_GoreGpuTarget(inst)) {
+        return qfalse;
+    }
+    qglViewport(0, 0, w, h);
+    GL_BindMultiTexture(GL_TEXTURE0, GL_TEXTURE_2D, img->texnum);
+    GL_UseProgram(s_gg.progBase);
+    qglUniform4f(s_gg.uBaseP, (float)level, 0.0f, 0.0f, 0.0f);
+    qglBindVertexArray(s_gg.vao);
+    qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    s_gg.draws++;
+    s_gg.fills++;
+    return qtrue;
+}
+
+// (re)load the two art layers into their textures, byte for byte
+static void R_GoreGpuArt(void)
+{
+    int i;
+
+    if (!s_goreArtDirty) {
+        return;
+    }
+    s_goreArtDirty = qfalse;
+
+    for (i = 0; i < 2; i++) {
+        const byte *pix = i ? s_splashPix : s_stampPix;
+        int         w   = i ? s_splashW : s_stampW;
+        int         h   = i ? s_splashH : s_stampH;
+        GLuint      tex = s_gg.art[i]->texnum;
+
+        if (!pix || w < 1 || h < 1) {
+            continue;
+        }
+        qglTextureImage2DEXT(tex, GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        qglTextureParameterfEXT(tex, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        s_gg.art[i]->width = s_gg.art[i]->uploadWidth = w;
+        s_gg.art[i]->height = s_gg.art[i]->uploadHeight = h;
+    }
+
+    // r_goreGpu 2 self-test of the base pass on an UNCOMPRESSED source: copy the splash art (RGBA8, uploaded byte
+    // for byte just above) into the scratch target with the base program and read it back. It has to come back
+    // exactly - which pins every "base copy" difference the verify lines report on the driver decoding a
+    // COMPRESSED texture differently for glGetTexImage than the GPU does for sampling, not on this pass.
+    if (r_goreGpu && r_goreGpu->integer >= 2 && s_splashPix && s_splashW <= GORE_GPU_SCRATCH && s_splashH <= GORE_GPU_SCRATCH) {
+        int   n   = s_splashW * s_splashH * 4, bad = 0;
+        byte *got = ri.Malloc(n);
+
+        GL_BindFramebuffer(GL_FRAMEBUFFER, s_gg.fboScratch);
+        qglViewport(0, 0, s_splashW, s_splashH);
+        GL_BindMultiTexture(GL_TEXTURE0, GL_TEXTURE_2D, s_gg.art[1]->texnum);
+        GL_UseProgram(s_gg.progBase);
+        qglUniform4f(s_gg.uBaseP, 0.0f, 0.0f, 0.0f, 0.0f);
+        qglBindVertexArray(s_gg.vao);
+        qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        qglReadPixels(0, 0, s_splashW, s_splashH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        for (i = 0; i < n; i++) {
+            if (got[i] != s_splashPix[i]) {
+                bad++;
+            }
+        }
+        ri.Free(got);
+        ri.Printf(
+            PRINT_ALL, "^~^~^ GORE VERIFY selftest: base pass on an uncompressed %dx%d texture, %d of %d bytes differ\n",
+            s_splashW, s_splashH, bad, n
+        );
+    }
+}
+
+static int R_GoreFloorDiv(int a, int b)
+{
+    int q = a / b;
+
+    if ((a % b) != 0 && ((a < 0) != (b < 0))) {
+        q--;
+    }
+    return q;
+}
+
+/*
+================
+R_GoreGpuStampLayer
+
+The GPU twin of R_GoreStampLayer's loop: the same arguments, the same texels, the same order.
+================
+*/
+static void R_GoreGpuStampLayer(goreInstance_t *inst, int art, int artW, int artH, int px, int py, float angle, int size)
+{
+    int   w    = inst->width;
+    int   h    = inst->height;
+    int   half = size / 2;
+    int   x0   = px - half, x1 = px + half; // the loop's dx range [-half, half), unwrapped
+    int   y0   = py - half, y1 = py + half;
+    int   kx, ky, kx0, kx1, ky0, ky1;
+    float ca, sa, scale;
+
+    if (half < 1 || w < 1 || h < 1) {
+        return;
+    }
+
+    ca    = (float)cos(angle);
+    sa    = (float)sin(angle);
+    scale = (float)artW / (float)size;
+
+    R_GoreGpuBegin();
+    R_GoreGpuArt();
+    if (!R_GoreGpuTarget(inst)) {
+        return;
+    }
+    GL_BindMultiTexture(GL_TEXTURE0, GL_TEXTURE_2D, s_gg.scratch->texnum);
+    GL_BindMultiTexture(GL_TEXTURE1, GL_TEXTURE_2D, s_gg.art[art]->texnum);
+    GL_UseProgram(s_gg.progStamp);
+    qglUniform4f(s_gg.uStampRot, ca, sa, scale, 0.0f);
+    qglUniform4f(s_gg.uStampArt, (float)artW, (float)artH, 0.0f, 0.0f);
+    qglBindVertexArray(s_gg.vao);
+
+    // one pass per texture tile the rectangle touches; rows outer / columns inner is the CPU loop's order,
+    // which matters only when the stamp is larger than the texture and overlaps itself
+    kx0 = R_GoreFloorDiv(x0, w);
+    kx1 = R_GoreFloorDiv(x1 - 1, w);
+    ky0 = R_GoreFloorDiv(y0, h);
+    ky1 = R_GoreFloorDiv(y1 - 1, h);
+    for (ky = ky0; ky <= ky1; ky++) {
+        for (kx = kx0; kx <= kx1; kx++) {
+            int ax0 = x0 > kx * w ? x0 : kx * w;
+            int ax1 = x1 < (kx + 1) * w ? x1 : (kx + 1) * w;
+            int ay0 = y0 > ky * h ? y0 : ky * h;
+            int ay1 = y1 < (ky + 1) * h ? y1 : (ky + 1) * h;
+            int lx0 = ax0 - kx * w, lx1 = ax1 - kx * w; // this tile's piece, in texture texels
+            int ly0 = ay0 - ky * h, ly1 = ay1 - ky * h;
+            int cx, cy;
+
+            for (cy = ly0; cy < ly1; cy += GORE_GPU_SCRATCH) {
+                for (cx = lx0; cx < lx1; cx += GORE_GPU_SCRATCH) {
+                    int cw = lx1 - cx > GORE_GPU_SCRATCH ? GORE_GPU_SCRATCH : lx1 - cx;
+                    int ch = ly1 - cy > GORE_GPU_SCRATCH ? GORE_GPU_SCRATCH : ly1 - cy;
+
+                    // the destination as it is now -> scratch (read it there: no feedback loop)
+                    GL_BindFramebuffer(GL_READ_FRAMEBUFFER, s_gg.fboInst);
+                    GL_BindFramebuffer(GL_DRAW_FRAMEBUFFER, s_gg.fboScratch);
+                    qglBlitFramebuffer(cx, cy, cx + cw, cy + ch, 0, 0, cw, ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                    GL_BindFramebuffer(GL_DRAW_FRAMEBUFFER, s_gg.fboInst);
+
+                    qglViewport(cx, cy, cw, ch);
+                    qglUniform4f(s_gg.uStampOrg, (float)(px - kx * w), (float)(py - ky * h), (float)cx, (float)cy);
+                    qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                    s_gg.blits++;
+                    s_gg.draws++;
+                }
+            }
+        }
+    }
+}
+
+/*
+================
+R_GoreGpuVerify
+
+r_goreGpu 2: read the GPU-painted instance back and compare it with the CPU reference copy. `base` = this is the
+check of the base copy alone (GPU sampling against the glGetTexImage readback - decoding, not compositing); the
+reference then ADOPTS the GPU's texels, so that every later check measures the compositing and nothing else.
+================
+*/
+static void R_GoreGpuVerify(goreInstance_t *inst, const char *what, qboolean base, const image_t *img)
+{
+    int         n = inst->width * inst->height;
+    int         i, c, bad = 0, maxd = 0;
+    byte       *got;
+    const char *name;
+
+    if (!inst->pixels || !qglGetTexImage || n <= 0) {
+        return;
+    }
+    // the base check names the image being copied and its GL internal format (compressed formats are what differ)
+    name = img ? va("%s (format 0x%x)", img->imgName, img->internalFormat)
+               : (inst->baseImage ? inst->baseImage->imgName : "?");
+    got = ri.Malloc(n * 4);
+    R_GoreReadTexImage(inst->instImage, 0, got);
+    for (i = 0; i < n; i++) {
+        const byte *a = inst->pixels + i * 4;
+        const byte *b = got + i * 4;
+        int         d = 0;
+
+        for (c = 0; c < 4; c++) {
+            int e = a[c] > b[c] ? a[c] - b[c] : b[c] - a[c];
+
+            if (e > d) {
+                d = e;
+            }
+        }
+        if (d) {
+            bad++;
+            if (d > maxd) {
+                maxd = d;
+            }
+        }
+    }
+    if (base) {
+        s_gg.vBaseBadTexels += bad;
+        if (maxd > s_gg.vBaseMaxDiff) {
+            s_gg.vBaseMaxDiff = maxd;
+        }
+        Com_Memcpy(inst->pixels, got, n * 4);
+    } else {
+        s_gg.vChecks++;
+        s_gg.vBadTexels += bad;
+        if (maxd > s_gg.vMaxDiff) {
+            s_gg.vMaxDiff = maxd;
+        }
+    }
+    ri.Free(got);
+    ri.Printf(
+        PRINT_ALL,
+        "^~^~^ GORE VERIFY %s ent %d %s %dx%d stamps %d: %d of %d texels differ, max diff %d | run: %d composite checks, %d texels off, max %d; base copies %d texels off, max %d\n",
+        what, inst->entityNumber, name, inst->width, inst->height,
+        inst->numStamps, bad, n, maxd, s_gg.vChecks, s_gg.vBadTexels, s_gg.vMaxDiff, s_gg.vBaseBadTexels,
+        s_gg.vBaseMaxDiff
+    );
+}
+
+static void R_GoreGpuShutdown(void)
+{
+    if (s_gg.progBase) {
+        qglDeleteProgram(s_gg.progBase);
+    }
+    if (s_gg.progStamp) {
+        qglDeleteProgram(s_gg.progStamp);
+    }
+    if (s_gg.fboInst) {
+        qglDeleteFramebuffers(1, &s_gg.fboInst);
+    }
+    if (s_gg.fboScratch) {
+        qglDeleteFramebuffers(1, &s_gg.fboScratch);
+    }
+    if (s_gg.vao) {
+        qglDeleteVertexArrays(1, &s_gg.vao);
+    }
+    Com_Memset(&s_gg, 0, sizeof(s_gg)); // the image slots die with R_DeleteTextures
+    s_goreArtDirty = qtrue;
+}
+
+static void R_GoreStampPixels(goreInstance_t *inst, const goreStampRec_t *st, int *outPy, int *outHalf);
+
+/*
+================
+R_GoreFillInstance
+
+(Re)build an instance's texture for base image `img`: the base copy, then the recorded stamps on top - the one
+routine behind creation (no stamps yet), the bug-754 tier-skin rebase and an r_goreGpu mode switch.  CPU path:
+readback (or the base-pixel cache) into `pixels`, composite, upload - what creation and rebase each did inline
+before.  GPU path: R_GoreGpuBase and the stamp quads.  Returns qfalse only if neither path can run.
+================
+*/
+static qboolean R_GoreFillInstance(goreInstance_t *inst, image_t *img, int w, int h, int level)
+{
+    qboolean gpu = R_GoreGpuReady(img);
+    qboolean cpuCopy;
+    int      dbg = r_goreDebug ? r_goreDebug->integer : 0;
+    int      i, py, half, t0 = 0;
+
+    if (gpu) {
+        if (dbg >= 2) {
+            qglFinish(); // time the GPU's work, not just the submission
+        }
+        t0 = ri.Milliseconds();
+        if (!R_GoreGpuBase(inst, img, w, h, level)) {
+            gpu = qfalse;
+        }
+    }
+    if (!gpu && !qglGetTexImage) {
+        return qfalse; // loader could not resolve the readback entry point
+    }
+    cpuCopy = !gpu || (r_goreGpu->integer >= 2 && qglGetTexImage);
+
+    if (!cpuCopy) {
+        if (inst->pixels) {
+            ri.Free(inst->pixels);
+            inst->pixels = NULL;
+        }
+    } else if (!inst->pixels || w != inst->width || h != inst->height) {
+        if (inst->pixels) {
+            ri.Free(inst->pixels);
+        }
+        inst->pixels = ri.Malloc(w * h * 4);
+    }
+    inst->gpu       = gpu;
+    inst->width     = w;
+    inst->height    = h;
+    inst->fullWidth = img->uploadWidth;
+    inst->instImage->width = inst->instImage->uploadWidth = w;
+    inst->instImage->height = inst->instImage->uploadHeight = h;
+
+    if (cpuCopy) {
+        // read the uploaded base texture back (post-picmip, post-lightscale ->
+        // the copy is pixel-identical to what everyone else renders)
+        R_GoreBasePixels(img, level, w, h, inst->pixels); // [bug-3493] cached per uniform texture
+        if (gpu) {
+            R_GoreGpuVerify(inst, "base", qtrue, img);
+        }
+    }
+
+    for (i = 0; i < inst->numStamps; i++) {
+        R_GoreStampPixels(inst, &inst->stamps[i], &py, &half);
+    }
+
+    if (!gpu) {
+        // respecify our instance slot with the copy (gl2 RE_UploadCinematic pattern:
+        // the DSA-wrapped texture entry points keep the tr_dsa binding cache coherent)
+        GLuint texture = inst->instImage->texnum;
+        float  wrapS   = (img->flags & IMGFLAG_CLAMPTOEDGE) ? (float)GL_CLAMP_TO_EDGE : (float)GL_REPEAT;
+
+        qglTextureImage2DEXT(texture, GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, inst->pixels);
+        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapS);
+        inst->texW = w;
+        inst->texH = h;
+        if (s_gg.attached == texture) {
+            s_gg.attached = 0;
+        }
+    } else {
+        if (cpuCopy && inst->numStamps) {
+            R_GoreGpuVerify(inst, "replay", qfalse, NULL);
+        }
+        if (dbg) {
+            if (dbg >= 2) {
+                qglFinish();
+            }
+            ri.Printf(
+                PRINT_ALL, "^~^~^ GORE gpu fill %s %dx%d (mip %d), %d stamps replayed, took %d ms%s\n", img->imgName, w,
+                h, level, inst->numStamps, ri.Milliseconds() - t0, dbg >= 2 ? " (finished)" : " (submitted)"
+            );
+        }
+    }
+    return qtrue;
+}
+
+/*
+================
+R_GoreModeSync
+
+r_goreGpu changed: rebuild every live instance from its base image and stamp records in the other mode, so a
+wound never depends on which path painted it first (and so the two paths can be compared on the same frame).
+================
+*/
+static void R_GoreModeSync(void)
+{
+    int i, mode, n = 0;
+
+    if (!r_goreGpu) {
+        // 1 = wounds are composited on the GPU (no texture ever read back); 0 = the CPU path; 2 = GPU + verify
+        r_goreGpu = ri.Cvar_Get("r_goreGpu", "1", CVAR_ARCHIVE);
+    }
+    mode = r_goreGpu->integer;
+    if (mode == s_goreMode) {
+        return;
+    }
+    s_goreMode = mode;
+
+    for (i = 0; i < GORE_MAX_INSTANCES; i++) {
+        goreInstance_t *inst = &s_goreInstances[i];
+        int             w, h, level;
+
+        if (!inst->inuse || !inst->instImage || !inst->baseImage || !inst->baseImage->texnum) {
+            continue;
+        }
+        R_GoreInstanceDims(inst->baseImage, &w, &h, &level);
+        if (!R_GoreFillInstance(inst, inst->baseImage, w, h, level)) {
+            R_GoreFreeInstance(inst);
+        }
+        n++;
+    }
+    if (n) {
+        R_GoreRebuildEntityFlags();
+    }
+    if (r_goreDebug && r_goreDebug->integer) {
+        ri.Printf(PRINT_ALL, "^~^~^ GORE mode r_goreGpu %d: %d live instance(s) rebuilt\n", mode, n);
+    }
+}
+
+/*
 ================
 R_GoreAcquireInstance
 
@@ -1330,8 +2183,8 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
         }
         inst = NULL;
     }
-    if (!qglGetTexImage) {
-        return NULL; // loader could not resolve the readback entry point
+    if (!qglGetTexImage && !R_GoreGpuReady(baseImage)) {
+        return NULL; // loader could not resolve the readback entry point (and no GPU compositor either)
     }
     R_GoreInstanceDims(baseImage, &w, &h, &level); // [bug-3493] a mip of an HD skin, not all 16 MB of it
     if (w < 8 || h < 8 || w * h * 4 > GORE_MAX_TEXBYTES) {
@@ -1398,37 +2251,20 @@ static goreInstance_t *R_GoreAcquireInstance(int entityNumber, image_t *baseImag
         inst->instImage->r_sequence = -1; // builtin-style: never purged between levels
     }
 
-    inst->pixels = ri.Malloc(w * h * 4);
-
-    // read the uploaded base texture back (post-picmip, post-lightscale ->
-    // the copy is pixel-identical to what everyone else renders)
-    R_GoreBasePixels(baseImage, level, w, h, inst->pixels); // [bug-3493] cached per uniform texture
-
-    // respecify our instance slot with the copy (gl2 RE_UploadCinematic pattern:
-    // the DSA-wrapped texture entry points keep the tr_dsa binding cache coherent)
-    {
-        GLuint texture = inst->instImage->texnum;
-        float  wrapS   = (baseImage->flags & IMGFLAG_CLAMPTOEDGE) ? (float)GL_CLAMP_TO_EDGE : (float)GL_REPEAT;
-
-        inst->instImage->width = inst->instImage->uploadWidth = w;
-        inst->instImage->height = inst->instImage->uploadHeight = h;
-        qglTextureImage2DEXT(texture, GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, inst->pixels);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapS);
+    // the base copy (no stamps yet): GPU = one quad into the instance texture, CPU = readback + upload
+    inst->numStamps    = 0;
+    inst->stampHead    = 0;
+    inst->entityNumber = entityNumber; // for the debug / verify lines of the fill
+    if (!R_GoreFillInstance(inst, baseImage, w, h, level)) {
+        inst->entityNumber = -1;
+        return NULL;
     }
 
     inst->inuse        = qtrue;
     inst->entityNumber = entityNumber;
     inst->baseImage    = baseImage;
     inst->rebaseImage  = NULL;
-    inst->numStamps    = 0;
-    inst->stampHead    = 0;
     R_GoreImageFamily(baseImage->imgName, inst->family, sizeof(inst->family)); // bug-754
-    inst->width        = w;
-    inst->height       = h;
-    inst->fullWidth    = baseImage->uploadWidth;
     inst->lastUseFrame = tr.frameCount;
     s_goreActiveCount++;
     if (entityNumber >= 0 && entityNumber < GORE_MAX_ENTNUM) {
@@ -1448,7 +2284,7 @@ paint two layers (splash halo under, hole core over).
 ================
 */
 static void R_GoreStampLayer(
-    goreInstance_t *inst, const byte *artPix, int artW, int artH, int px, int py, float angle, int size)
+    goreInstance_t *inst, int art, const byte *artPix, int artW, int artH, int px, int py, float angle, int size)
 {
     int   w = inst->width;
     int   h = inst->height;
@@ -1458,6 +2294,14 @@ static void R_GoreStampLayer(
 
     if (!artPix || size < 2) {
         return;
+    }
+
+    // r_goreGpu: the same texels, painted by a quad into the instance texture (art: 0 = hole, 1 = splash)
+    if (inst->gpu) {
+        R_GoreGpuStampLayer(inst, art, artW, artH, px, py, angle, size);
+    }
+    if (!inst->pixels) {
+        return; // no CPU copy (it exists beside a GPU instance only as the r_goreGpu 2 reference)
     }
 
     ca    = (float)cos(angle);
@@ -1572,11 +2416,11 @@ static void R_GoreStampPixels(goreInstance_t *inst, const goreStampRec_t *st, in
     half = 0;
     if (s_splashPix) {
         // decorrelate the splash rotation from the hole so the pair never reads as one shape
-        R_GoreStampLayer(inst, s_splashPix, s_splashW, s_splashH, px, py, st->angle * 1.7f + 1.1f, splashSize);
+        R_GoreStampLayer(inst, 1, s_splashPix, s_splashW, s_splashH, px, py, st->angle * 1.7f + 1.1f, splashSize);
         half = splashSize / 2;
     }
     if (st->kind == 0 && s_stampPix) {
-        R_GoreStampLayer(inst, s_stampPix, s_stampW, s_stampH, px, py, st->angle, holeSize);
+        R_GoreStampLayer(inst, 0, s_stampPix, s_stampW, s_stampH, px, py, st->angle, holeSize);
         if (holeSize / 2 > half) {
             half = holeSize / 2;
         }
@@ -1651,7 +2495,11 @@ static void R_GoreApplyStamp(goreInstance_t *inst, const goreStampRec_t *rec)
     }
 
     R_GoreStampPixels(inst, rec, &py, &half);
-    R_GoreStampUploadBand(inst, py, half);
+    if (!inst->gpu) {
+        R_GoreStampUploadBand(inst, py, half);
+    } else if (inst->pixels) {
+        R_GoreGpuVerify(inst, "stamp", qfalse, NULL); // r_goreGpu 2
+    }
     inst->lastUseFrame = tr.frameCount;
 }
 
@@ -1738,7 +2586,7 @@ current (called from R_GoreCommitPending / R_GoreAcquireInstance).
 static void R_GoreRebaseInstance(goreInstance_t *inst)
 {
     image_t *newImg = inst->rebaseImage;
-    int      w, h, i, py, half, level = 0;
+    int      w, h, level = 0;
 
     inst->rebaseImage = NULL;
     if (!newImg || newImg == inst->baseImage) {
@@ -1749,37 +2597,12 @@ static void R_GoreRebaseInstance(goreInstance_t *inst)
     if (newImg->texnum) {
         R_GoreInstanceDims(newImg, &w, &h, &level); // [bug-3493]
     }
-    if (!qglGetTexImage || newImg->texnum == 0 || w < 8 || h < 8 || w * h * 4 > GORE_MAX_TEXBYTES) {
+    // the new base, then the recorded wounds replayed onto it (GPU: quads; CPU: readback, composite, upload)
+    if (newImg->texnum == 0 || w < 8 || h < 8 || w * h * 4 > GORE_MAX_TEXBYTES
+        || !R_GoreFillInstance(inst, newImg, w, h, level)) {
         R_GoreFreeInstance(inst);
         R_GoreRebuildEntityFlags();
         return;
-    }
-
-    if (w != inst->width || h != inst->height) {
-        ri.Free(inst->pixels);
-        inst->pixels = ri.Malloc(w * h * 4);
-        inst->width  = w;
-        inst->height = h;
-    }
-
-    R_GoreBasePixels(newImg, level, w, h, inst->pixels); // [bug-3493]
-    inst->fullWidth = newImg->uploadWidth;
-
-    for (i = 0; i < inst->numStamps; i++) {
-        R_GoreStampPixels(inst, &inst->stamps[i], &py, &half);
-    }
-
-    {
-        GLuint texture = inst->instImage->texnum;
-        float  wrapS   = (newImg->flags & IMGFLAG_CLAMPTOEDGE) ? (float)GL_CLAMP_TO_EDGE : (float)GL_REPEAT;
-
-        inst->instImage->width = inst->instImage->uploadWidth = w;
-        inst->instImage->height = inst->instImage->uploadHeight = h;
-        qglTextureImage2DEXT(texture, GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, inst->pixels);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
-        qglTextureParameterfEXT(texture, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapS);
     }
 
     inst->baseImage = newImg;
@@ -1796,6 +2619,80 @@ static void R_GoreRebaseInstance(goreInstance_t *inst)
 
 /*
 ================
+R_GoreDebugCommand
+
+r_goreDebug only: a test hook, so a wound can be placed exactly and repeatably (the QA stills compare the two
+compositors on the same wounds). Set the cvar r_goreTest to ONE command; it is consumed at the end of the frame:
+  seg x y z x y z    queue a bullet segment (world space), as cgame does for a real bullet
+  uv ENT N U V SKIN  stamp a wound at UV (u,v) on entity ENT's N-th wound instance (it must exist already)
+  kill ENT           the killing-blow splashes on entity ENT
+  seed N             reseed the stamp rotation / size jitter
+  list               print the live instances
+================
+*/
+static void R_GoreDebugCommand(void)
+{
+    static cvar_t *test = NULL;
+    char           buf[256];
+    float          f[6];
+    int            a, b, c, i, k;
+    unsigned int   u;
+
+    if (!r_goreDebug || !r_goreDebug->integer) {
+        return;
+    }
+    if (!test) {
+        test = ri.Cvar_Get("r_goreTest", "", CVAR_TEMP);
+    }
+    if (!test->string[0]) {
+        return;
+    }
+    Q_strncpyz(buf, test->string, sizeof(buf));
+    ri.Cvar_Set("r_goreTest", "");
+
+    if (sscanf(buf, "seg %f %f %f %f %f %f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5]) == 6) {
+        RE_GoreImpact(f, f + 3);
+    } else if (sscanf(buf, "uv %d %d %f %f %d", &a, &b, &f[0], &f[1], &c) == 5) {
+        for (i = 0, k = 0; i < GORE_MAX_INSTANCES; i++) {
+            goreInstance_t *inst = &s_goreInstances[i];
+
+            if (inst->inuse && inst->entityNumber == a && inst->instImage && k++ == b) {
+                R_GoreLoadStamp();
+                R_GoreStampInstance(inst, f[0], f[1], qfalse, 0.0f, c ? qtrue : qfalse);
+                ri.Printf(
+                    PRINT_ALL, "^~^~^ GORE TEST uv stamp ent %d slot %d (%s %dx%d) uv (%.4f %.4f) stamps %d\n", a, i,
+                    inst->baseImage->imgName, inst->width, inst->height, f[0], f[1], inst->numStamps
+                );
+                break;
+            }
+        }
+        if (i == GORE_MAX_INSTANCES) {
+            ri.Printf(PRINT_ALL, "^~^~^ GORE TEST uv: ent %d has no instance %d\n", a, b);
+        }
+    } else if (sscanf(buf, "kill %d", &a) == 1) {
+        RE_GoreKillSplash(a);
+    } else if (sscanf(buf, "seed %u", &u) == 1) {
+        s_goreSeed = u;
+    } else if (!Q_stricmpn(buf, "list", 4)) {
+        for (i = 0; i < GORE_MAX_INSTANCES; i++) {
+            goreInstance_t *inst = &s_goreInstances[i];
+
+            if (inst->inuse) {
+                ri.Printf(
+                    PRINT_ALL, "^~^~^ GORE LIST slot %d ent %d %s %dx%d stamps %d %s lastUse %d\n", i,
+                    inst->entityNumber, inst->baseImage ? inst->baseImage->imgName : "?", inst->width, inst->height,
+                    inst->numStamps, inst->gpu ? (inst->pixels ? "gpu+ref" : "gpu") : "cpu", inst->lastUseFrame
+                );
+            }
+        }
+        ri.Printf(PRINT_ALL, "^~^~^ GORE LIST end: %d active, r_goreGpu %d\n", s_goreActiveCount, s_goreMode);
+    } else {
+        ri.Printf(PRINT_ALL, "^~^~^ GORE TEST: did not understand '%s'\n", buf);
+    }
+}
+
+/*
+================
 R_GoreCommitPending
 
 End of frame (all skel surfaces skinned and tested, GL work for the frame
@@ -1807,6 +2704,10 @@ void R_GoreCommitPending(void)
 {
     int i;
     int now;
+
+    // r_goreGpu: (register the cvar and) rebuild the live instances if the compositor mode changed
+    R_GoreModeSync();
+    R_GoreDebugCommand(); // r_goreDebug: the r_goreTest hook
 
     // bug-754: apply tier-skin rebases first (scheduled by R_GoreOverrideImage when a wounded
     // surface bound a different _bloodN diffuse this frame) so new stamps land on the new copy
@@ -1983,6 +2884,9 @@ void R_GoreCommitPending(void)
             }
         }
     }
+
+    // r_goreGpu: put back the GL state the instance passes of this commit changed (no-op if there were none)
+    R_GoreGpuEnd();
 }
 
 /*
@@ -2030,7 +2934,8 @@ void R_GoreLevelReset(void)
 R_GoreShutdown
 
 Renderer shutdown (before R_DeleteTextures wipes every GL texture): free
-CPU buffers and forget the image slots so a restart re-creates them.
+CPU buffers and forget the image slots so a restart re-creates them, and
+delete the GPU compositor's own GL objects.
 ================
 */
 void R_GoreShutdown(void)
@@ -2042,7 +2947,14 @@ void R_GoreShutdown(void)
         s_goreInstances[i].instImage    = NULL;
         s_goreInstances[i].lastUseFrame = 0;
     }
+    for (i = 0; i < GORE_MAX_INSTANCES; i++) {
+        s_goreInstances[i].texW = s_goreInstances[i].texH = 0;
+    }
     for (i = 0; i < GORE_BASECACHE_SLOTS; i++) { // [bug-3493] the textures these were read from are about to go
         R_GoreBaseFree(&s_goreBase[i]);
     }
+    // r_goreGpu: the framebuffers / programs / vertex array are ours to delete (the context is still current
+    // at both call sites); the scratch and art image slots go with R_DeleteTextures right after this
+    R_GoreGpuShutdown();
+    s_goreMode = -1;
 }
