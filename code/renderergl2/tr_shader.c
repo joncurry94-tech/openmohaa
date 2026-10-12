@@ -4730,6 +4730,13 @@ shader_t *R_FindShaderEx( const char *name, int lightmapIndex, qboolean mipRawIm
 		}
 	}
 
+	// HZM coop [bug-3493] a shader that has to be CREATED: if the map finished loading already this is a mid-game
+	// load (file read, decode, upload on the frame it is needed) - remember it for this map's next load
+	{
+		extern void R_HzmPreloadNote( const char *name, int lightmapIndex, qboolean mipRawImage, int realLightmapIndex );
+		R_HzmPreloadNote( strippedName, lightmapIndex, mipRawImage, realLightmapIndex );
+	}
+
 	InitShaderEx( strippedName, lightmapIndex, realLightmapIndex );
 
 	//

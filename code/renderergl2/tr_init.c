@@ -2489,6 +2489,10 @@ void RE_Shutdown( qboolean destroyWindow ) {
 
 	// HZM gl2 [bug-3487] the skinning workers live in this DLL, and it is unloaded on every vid_restart
 	R_SkelThreadsShutdown();
+	{
+		extern void R_HzmPreloadFlush( void );	// HZM coop [bug-3493] quit or vid_restart: same, before the DLL goes
+		R_HzmPreloadFlush();
+	}
 
 	ri.Printf( PRINT_ALL, "RE_Shutdown( %i )\n", destroyWindow );
 
@@ -2563,6 +2567,12 @@ void RE_Shutdown( qboolean destroyWindow ) {
 ** RE_BeginRegistration
 */
 void RE_BeginRegistration(glconfig_t* glconfigOut) {
+
+    {
+        // HZM coop [bug-3493] the map that was loaded is going away: write the shaders it had to load mid-play
+        extern void R_HzmPreloadFlush( void );
+        R_HzmPreloadFlush();
+    }
 
     // HZM gl2 (#77 vid_restart crash): gl2 never called ri.Hunk_Clear(), so every runtime
     // vid_restart LEAKED the entire TAG_STATIC_RENDERER zone (world, images, shaders, models,
@@ -2666,6 +2676,11 @@ Touch all images to make sure they are resident
 =============
 */
 void RE_EndRegistration( void ) {
+	{
+		// HZM coop [bug-3493] register what this map needed mid-play last time, then start recording (tr_hzm_preload.c)
+		extern void R_HzmPreloadMapLoaded( void );
+		R_HzmPreloadMapLoaded();
+	}
 	R_IssuePendingRenderCommands();
 	if (!ri.Sys_LowPhysicalMemory()) {
 		RB_ShowImages();
