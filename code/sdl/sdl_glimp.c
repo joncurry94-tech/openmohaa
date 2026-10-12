@@ -1401,10 +1401,10 @@ GLimp_EndFrame
 Responsible for doing a swapbuffers
 ===============
 */
-void GLimp_EndFrame( void )
+static void GLimp_EndFrameEx( qboolean doSwap )
 {
 	// don't flip if drawing to front buffer
-	if ( Q_stricmp( r_drawBuffer->string, "GL_FRONT" ) != 0 )
+	if ( doSwap && Q_stricmp( r_drawBuffer->string, "GL_FRONT" ) != 0 )
 	{
 		SDL_GL_SwapWindow( SDL_window );
 	}
@@ -1455,4 +1455,86 @@ void GLimp_EndFrame( void )
 
 		r_fullscreen->modified = qfalse;
 	}
+}
+
+void GLimp_EndFrame( void )
+{
+	GLimp_EndFrameEx( qtrue );
+}
+
+/*
+===============
+HZM frame generation (r_hzmFrameGen, renderergl2/tr_hzm_framegen.c)
+
+A second GL context that SHARES objects with the main one, for the present thread. Only these few entry points
+know about SDL's window and contexts; everything else lives in the renderer.
+===============
+*/
+// the main thread's end-of-frame housekeeping (the r_fullscreen toggle) without the swap: the present thread swaps
+void GLimp_FG_EndFrameNoSwap( void )
+{
+	GLimp_EndFrameEx( qfalse );
+}
+
+// main thread, main context current. Returns the new context (NULL on failure); the main context is current again on return.
+void *GLimp_FG_CreateContext( void )
+{
+	SDL_GLContext ctx;
+
+	if ( !SDL_window || !SDL_glContext ) {
+		return NULL;
+	}
+	SDL_GL_SetAttribute( SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1 );
+	ctx = SDL_GL_CreateContext( SDL_window );
+	SDL_GL_SetAttribute( SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0 );
+	if ( !ctx ) {
+		ri.Printf( PRINT_WARNING, "GLimp_FG_CreateContext: %s\n", SDL_GetError() );
+	}
+	// creating a context makes it current: hand the thread back to the main one
+	if ( SDL_GL_MakeCurrent( SDL_window, SDL_glContext ) != 0 ) {
+		ri.Printf( PRINT_WARNING, "GLimp_FG_CreateContext: main context not restored: %s\n", SDL_GetError() );
+	}
+	return (void *)ctx;
+}
+
+void GLimp_FG_DeleteContext( void *ctx )
+{
+	if ( ctx ) {
+		SDL_GL_DeleteContext( (SDL_GLContext)ctx );
+	}
+}
+
+// ctx NULL = the main context (main thread only). Any thread may make the frame-gen context current on itself,
+// one thread at a time. Returns qfalse on failure.
+qboolean GLimp_FG_MakeCurrent( void *ctx )
+{
+	if ( !SDL_window ) {
+		return qfalse;
+	}
+	return SDL_GL_MakeCurrent( SDL_window, ctx ? (SDL_GLContext)ctx : SDL_glContext ) == 0 ? qtrue : qfalse;
+}
+
+// the calling thread lets go of whatever context it holds (the present thread, before it exits)
+void GLimp_FG_ReleaseCurrent( void )
+{
+	if ( SDL_window ) {
+		SDL_GL_MakeCurrent( SDL_window, NULL );
+	}
+}
+
+void GLimp_FG_Swap( void )
+{
+	if ( SDL_window ) {
+		SDL_GL_SwapWindow( SDL_window );
+	}
+}
+
+void GLimp_FG_SetSwapInterval( int interval )
+{
+	SDL_GL_SetSwapInterval( interval );
+}
+
+void *GLimp_FG_GetProc( const char *name )
+{
+	return SDL_GL_GetProcAddress( name );
 }

@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_fbo.h"
 #include "tr_dsa.h"
 #include "tr_hzm_perf.h" // HZM coop [bug-3486]
+#include "tr_hzm_framegen.h" // HZM frame generation (r_hzmFrameGen)
 #include "../renderercommon/hzm_storm.h" // HZM coop [2026-09-28] storm darkness
 
 backEndData_t	*backEndData;
@@ -1499,6 +1500,9 @@ void RB_SetupGlobalFog( void ) {
 	// fog-specific test on purpose - see viewProjLatch_t in tr_local.h. It cannot alter fog
 	// behaviour: it writes only rb_viewProj and returns nothing. It sits BELOW the portal /
 	// sky-portal / shadow guard on purpose too, so a sub-view can never supply the matrix.
+	if ( R_FG_Wanted() ) {
+		R_FG_LatchView( &backEnd.viewParms );   // HZM frame generation: the same latch, for the same reason
+	}
 	{
 		const float *pm = backEnd.viewParms.projectionMatrix;
 
@@ -2123,6 +2127,7 @@ RB_SwapBuffers
 */
 const void	*RB_SwapBuffers( const void *data ) {
 	const swapBuffersCommand_t	*cmd;
+	int fgPresent;
 
 	// HZM gl2 (bug #73): new frame starts after this swap - re-arm the sceneless-frame clear
 	g_sceneThisFrame = 0;
@@ -2157,7 +2162,11 @@ const void	*RB_SwapBuffers( const void *data ) {
 		ri.Hunk_FreeTempMemory( stencilReadback );
 	}
 
-	if (glRefConfig.framebufferObject)
+	// HZM frame generation (r_hzmFrameGen, tr_hzm_framegen.c): 1 = the frame went to the present thread, which owns the
+	// back buffer and the swap; 2 = a generated picture is already in the back buffer (the single-threaded picture test)
+	fgPresent = ( glRefConfig.framebufferObject && R_FG_Wanted() ) ? R_FG_Present() : 0;
+
+	if (glRefConfig.framebufferObject && !fgPresent)
 	{
 		if (tr.msaaResolveFbo && r_hdr->integer && !tr.renderScaleActive && !tr.displaySplit)   // HZM render scale / MSAA display split: renderFbo is then already the single-sampled display
 		{
@@ -2182,13 +2191,17 @@ const void	*RB_SwapBuffers( const void *data ) {
 
 	R_HzmPerf_PresentBegin(); // HZM coop [bug-3486] time spent waiting for the GPU / the swap (tr_hzm_perf.c)
 
-	if ( !glState.finishCalled ) {
-		qglFinish();
+	if ( fgPresent != 1 ) {
+		if ( !glState.finishCalled ) {
+			qglFinish();
+		}
+
+		GLimp_LogComment( "***************** RB_SwapBuffers *****************\n\n\n" );
+
+		GLimp_EndFrame();
+
+		R_FG_NotePresentOff();
 	}
-
-	GLimp_LogComment( "***************** RB_SwapBuffers *****************\n\n\n" );
-
-	GLimp_EndFrame();
 
 	R_HzmPerf_PresentEnd();
 
@@ -2285,6 +2298,8 @@ const void *RB_PostProcess(const void *data)
 			else
 				FBO_FastBlit(rsSrc, NULL, tr.renderFbo, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		}
+		if (glRefConfig.framebufferObject && R_FG_Wanted())
+			R_FG_SceneDone((qboolean)(tr.msaaResolveFbo == NULL));   // HZM frame generation: the 3D picture is complete, the HUD comes next (no depth resolve ran on this path)
 		return (const void *)(cmd + 1);
 	}
 
@@ -2651,6 +2666,9 @@ const void *RB_PostProcess(const void *data)
 		}
 	}
 #endif
+
+	if (R_FG_Wanted())
+		R_FG_SceneDone(qtrue);   // HZM frame generation: the 3D picture is complete, the HUD comes next
 
 	R_GfxProbe_GpuMark(GPUMARK_POST_E);
 

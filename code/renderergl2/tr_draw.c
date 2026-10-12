@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // tr_draw.c -- drawing
 
 #include "tr_local.h"
+#include "tr_hzm_framegen.h" // HZM frame generation (r_hzmFrameGen)
 
 vec4_t r_colorWhite = { 1.0, 1.0, 1.0, 1.0 };
 
@@ -96,6 +97,7 @@ void Draw_StretchPic(float x, float y, float w, float h, float s1, float t1, flo
         w = shader->stages[0]->bundle[0].image[0]->width;
         h = shader->stages[0]->bundle[0].image[0]->height;
     }
+    R_FG_Note2D(w, h, shader->name);   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     // draw the pic
     RB_BeginSurface(shader, 0, 0);
@@ -143,6 +145,7 @@ void Draw_StretchPic2(float x, float y, float w, float h, float s1, float t1, fl
 
     R_IssuePendingRenderCommands();
     R_Ensure2DClear();
+    R_FG_Note2D(w, h, "stretchpic2");   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     if (glRefConfig.framebufferObject)
         FBO_Bind(tr.renderFbo);
@@ -198,6 +201,7 @@ void Draw_TilePic(float x, float y, float w, float h, qhandle_t hShader) {
     float        picw, pich;
 
     R_IssuePendingRenderCommands();
+    R_FG_Note2D(w, h, "tilepic");   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     if (glRefConfig.framebufferObject)
         FBO_Bind(tr.renderFbo);
@@ -249,6 +253,7 @@ void Draw_TilePicOffset(float x, float y, float w, float h, qhandle_t hShader, i
     float        picw, pich;
 
     R_IssuePendingRenderCommands();
+    R_FG_Note2D(w, h, "tilepic");   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     if (glRefConfig.framebufferObject)
         FBO_Bind(tr.renderFbo);
@@ -427,6 +432,7 @@ void AddBox(float x, float y, float w, float h) {
     vec4_t color;
 
     R_IssuePendingRenderCommands();
+    R_FG_Note2D(w, h, "(additive box)");   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     GL_BindToTMU(tr.whiteImage, TB_COLORMAP);
     GL_State(GLS_DEPTHTEST_DISABLE | GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE);
@@ -482,6 +488,7 @@ void DrawBox(float x, float y, float w, float h) {
     shader_t *shader;
 
     R_IssuePendingRenderCommands();
+    R_FG_Note2D(w, h, "(box)");   // HZM frame generation: a big 2D quad over the scene = an overlay is up
 
     if (glRefConfig.framebufferObject)
     {
@@ -623,6 +630,7 @@ void Set2DWindow(int x, int y, int w, int h, float left, float right, float bott
     qboolean wasIn2D;
 
     R_IssuePendingRenderCommands();
+    R_FG_Set2DWindow(right - left, bottom - top, w, h);   // HZM frame generation: the size 2D quads are measured against
 
     wasIn2D = backEnd.projection2D;
     backEnd.projection2D = qtrue;

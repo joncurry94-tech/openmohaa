@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // tr_init.c -- functions that are not called every frame
 
 #include "tr_local.h"
+#include "tr_hzm_framegen.h" // HZM frame generation (r_hzmFrameGen)
 
 #include "tr_dsa.h"
 
@@ -692,7 +693,13 @@ byte *RB_ReadPixels(int x, int y, int width, int height, size_t *offset, int *pa
 	buffer = ri.Hunk_AllocateTempMemory(padwidth * height + *offset + packAlign - 1);
 
 	bufstart = PADP((intptr_t) buffer + *offset, packAlign);
-	qglReadPixels(x, y, width, height, format, GL_UNSIGNED_BYTE, bufstart);
+	{
+		// HZM frame generation: with the present thread running the back buffer is its, not ours - read the last real frame
+		qboolean fgRead = R_FG_Wanted() ? R_FG_ReadSourceBegin() : qfalse;
+		qglReadPixels(x, y, width, height, format, GL_UNSIGNED_BYTE, bufstart);
+		if (fgRead)
+			R_FG_ReadSourceEnd();
+	}
 
 	linelen = width * 3;
 
@@ -2435,6 +2442,8 @@ void R_Init( void ) {
 	if (glRefConfig.framebufferObject)
 		FBO_Init();
 
+	R_FG_Init();   // HZM frame generation (r_hzmFrameGen): cvars and commands only, nothing GL until it is switched on
+
 	GLSL_InitGPUShaders();
 
 	// HZM gl2 MSAA (plan P2a, ME-F3): an MSAA program that failed to build re-initialises in place at 0 (no
@@ -2493,6 +2502,8 @@ void RE_Shutdown( qboolean destroyWindow ) {
 		extern void R_HzmPreloadFlush( void );	// HZM coop [bug-3493] quit or vid_restart: same, before the DLL goes
 		R_HzmPreloadFlush();
 	}
+	// HZM frame generation: so does the present thread, and it must stop before its textures and the window go
+	R_FG_Shutdown();
 
 	ri.Printf( PRINT_ALL, "RE_Shutdown( %i )\n", destroyWindow );
 
