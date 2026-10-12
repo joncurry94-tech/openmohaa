@@ -487,7 +487,10 @@ static void CG_CoopScoreHudMirror(void)
     int            want;
 
     if (!cvMp) {
+        // HZM-MP-BEGIN(mp_score_hud)
+        // read-only: which kind of session this is, so the shared Score HUD shows in multiplayer only
         cvMp  = cgi.Cvar_Get("coop_mp_session", "0", 0);
+        // HZM-MP-END(mp_score_hud)
         cvHud = cgi.Cvar_Get("cg_hudScore", "0", 0);
     }
     want = cvMp->integer ? 1 : 0;
