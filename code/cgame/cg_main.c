@@ -1028,6 +1028,9 @@ void CG_Init(clientGameImport_t *imported, int serverMessageNum, int serverComma
     cgi.Cvar_Set("coop_mp_session", "0");
     // [bug-3485] the pinned enemies-remaining line (cg_coopfeed.c) never survives a connect or a map load
     cgi.Cvar_Set("coop_ecLine", "");
+    cgi.Cvar_Set("coop_hudMed", ""); // [bug-3495] the item readout: same rule
+    cgi.Cvar_Set("coop_hudCov", "");
+    cgi.Cvar_Set("coop_hudAmmo", "");
     // HZM-MP-END(mp_armory_session)
 
     // HZM-MP-BEGIN(mp_kit_userinfo)

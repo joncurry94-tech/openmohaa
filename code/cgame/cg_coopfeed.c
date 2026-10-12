@@ -546,6 +546,250 @@ static void CG_DrawCoopPinned(void)
     cgi.R_SetColor(NULL);
 }
 
+/*
+====================
+CG_DrawCoopItems
+
+HZM coop [user 2026-10-11, bug-3495] "For the icons for the medkit, ammo box, and sandbags, can we use subscript for
+their amounts and underneath of them put the key that is bound to use them? Please keep all of it small so it isn't
+obnoxious and make sure it doesn't overlap with anything else on other resolutions."
+
+Was: three script-HUD icons with a verdana-14 number beside each, drawn at virtual-480 scale (31 px tall digits at
+1080p), and no way to show a key - a script cannot read the player's bindings. Now, per item that the server has
+published a count for (client cvars coop_hudMed / coop_hudCov / coop_hudAmmo; "" or "-" = not shown):
+
+    [icon]          the same art, a little smaller than before
+          2         the amount, in the feed's small type, hung off the icon's lower right corner
+      ]             the key bound to it, dimmer, centred underneath (nothing when it is unbound)
+
+Everything is laid out in PIXELS from the bottom-left corner: icon size and the row's height above the bottom follow
+the screen HEIGHT (so the row sits where the old one did, just under the feed's bottom edge at 70 virtual units, at
+every aspect ratio), text is the feed's own verdana-12 in hi-res units (12 px up to 1080p, scaled above), and the
+column pitch is whichever is larger - the icon plus a gap, or room for a six-character key name - so a key label
+can never run into its neighbour at any resolution; a longer name is cut to fit.
+====================
+*/
+#define COOPITEM_ICON_V   14.0f // icon edge, virtual-480 units
+#define COOPITEM_TOP_V    66.0f // top of the icons above the bottom of the screen, virtual-480 units (feed: 70)
+#define COOPITEM_LEFT_V   6.0f
+#define COOPITEM_GAP_V    12.0f
+#define COOPITEM_MIN_ICON 14.0f // pixels
+#define COOPITEM_KEY_PX   48.0f // room a key label is guaranteed, in hi-res units
+
+typedef struct {
+    const char *cvarName;
+    const char *bindCmd;
+    const char *shaderName;
+    cvar_t     *cv;
+    qhandle_t   hShader;
+    char        key[16];
+} coopItem_t;
+
+static coopItem_t s_coopItems[3] = {
+    {"coop_hudMed",  "append name ,8mk", "textures/hud/coop_medkit_icon",  NULL, 0, ""},
+    {"coop_hudCov",  "append name ,9cv", "textures/hud/coop_cover_icon",   NULL, 0, ""},
+    {"coop_hudAmmo", "append name ,abx", "textures/hud/coop_ammobox_icon", NULL, 0, ""},
+};
+
+// A key name as it is shown under an icon: upper case, and the long ones shortened so that what tells two keys
+// apart survives ("MOUSE4" was being cut to "MOUSE"). MOUSE4 -> M4, MWHEELUP -> WH-UP, KP_ENTER -> KP ENTER,
+// PAD0_DPAD_UP -> D-UP, PAD0_LEFTSTICK_UP -> LS UP. Whatever is still too wide is cut by the caller.
+static void CG_CoopItemKeyLabel(const char *nm, char *out, int outSize)
+{
+    static const struct {
+        const char *from, *to;
+    } sub[] = {
+        {"PAD0_", ""}, {"MWHEELUP", "WH-UP"}, {"MWHEELDOWN", "WH-DN"}, {"MOUSE", "M"}, {"DPAD_", "D-"},
+        {"LEFTSTICK", "LS"}, {"RIGHTSTICK", "RS"}, {"SHOULDER", "SH"}, {"TRIGGER", "TR"}, {"LEFTARROW", "LEFT"},
+        {"RIGHTARROW", "RIGHT"}, {"UPARROW", "UP"}, {"DOWNARROW", "DOWN"}, {"SEMICOLON", ";"},
+    };
+    char up[48];
+    int  i, n = 0, k;
+
+    for (i = 0; nm[i] && i < (int)sizeof(up) - 1; i++) {
+        up[i] = (char)toupper((unsigned char)nm[i]);
+    }
+    up[i] = 0;
+    i     = 0;
+    while (up[i] && n < outSize - 1) {
+        for (k = 0; k < (int)(sizeof(sub) / sizeof(sub[0])); k++) {
+            int len = (int)strlen(sub[k].from);
+
+            if (!strncmp(up + i, sub[k].from, len)) {
+                const char *t = sub[k].to;
+
+                while (*t && n < outSize - 1) {
+                    out[n++] = *t++;
+                }
+                i += len;
+                break;
+            }
+        }
+        if (k < (int)(sizeof(sub) / sizeof(sub[0]))) {
+            continue;
+        }
+        out[n++] = (up[i] == '_') ? ' ' : up[i];
+        i++;
+    }
+    out[n] = 0;
+}
+
+#define COOPITEM_FLOOR_U  48.0f // hi-res units above the bottom that stay clear: the retail team badge
+                                 // (cg_drawtools.cpp CG_DrawPlayerTeam) is 24 units tall and ends 46 up
+
+/*
+The row's geometry in pixels, shared with the feed. The top follows the screen HEIGHT (66 virtual units up, where
+the old script icons were), unless that would put the key labels on the team badge, which is laid out in fixed
+hi-res units - below about 610 px of height it does, and then the row is lifted to clear it.
+*/
+static float CG_CoopItemsTopPx(float *iconPxOut)
+{
+    float sy = cgs.uiHiResScale[1] > 0.0f ? cgs.uiHiResScale[1] : 1.0f;
+    float vs = (float)cgs.glconfig.vidHeight / 480.0f;
+    float iconPx, up, need;
+
+    iconPx = COOPITEM_ICON_V * vs;
+    if (iconPx < COOPITEM_MIN_ICON) {
+        iconPx = COOPITEM_MIN_ICON;
+    }
+    up   = COOPITEM_TOP_V * vs;                             // where it wants to be
+    need = COOPITEM_FLOOR_U * sy + 18.0f * sy + iconPx;     // badge + (gap and one line of label) + icon
+    if (up < need) {
+        up = need;
+    }
+    if (iconPxOut) {
+        *iconPxOut = iconPx;
+    }
+    return (float)cgs.glconfig.vidHeight - up;
+}
+
+static void CG_CoopItemKeys(void)
+{
+    static int nextMs = 0;
+    int        i, k1, k2;
+
+    if (cg.time < nextMs && cg.time + 2000 > nextMs) {
+        return;
+    }
+    nextMs = cg.time + 1000; // bindings change in a menu, never mid-frame: once a second is plenty
+    for (i = 0; i < 3; i++) {
+        coopItem_t *it = &s_coopItems[i];
+        const char *nm;
+
+        it->key[0] = 0;
+        k1 = k2 = -1;
+        cgi.Key_GetKeysForCommand(it->bindCmd, &k1, &k2);
+        if (k1 < 0) {
+            continue;
+        }
+        nm = cgi.Key_KeynumToBindString(k1);
+        if (!nm || !nm[0]) {
+            continue;
+        }
+        CG_CoopItemKeyLabel(nm, it->key, sizeof(it->key));
+    }
+}
+
+static void CG_DrawCoopItems(void)
+{
+    fontheader_t *font = CG_FeedFont();
+    float         sx   = cgs.uiHiResScale[0], sy = cgs.uiHiResScale[1];
+    float         vs   = (float)cgs.glconfig.vidHeight / 480.0f;
+    float         iconPx, topPx, pitchPx, xPx, textH;
+    vec4_t        c;
+    int           i, shown = 0;
+
+    if (!font || sx <= 0.0f || sy <= 0.0f) {
+        return;
+    }
+    CG_CoopItemKeys();
+
+    topPx   = CG_CoopItemsTopPx(&iconPx);
+    pitchPx = iconPx + COOPITEM_GAP_V * vs;
+    if (pitchPx < COOPITEM_KEY_PX * sx) {
+        pitchPx = COOPITEM_KEY_PX * sx;
+    }
+    textH = 12.0f * sy;
+    xPx   = COOPITEM_LEFT_V * vs;
+
+    for (i = 0; i < 3; i++) {
+        coopItem_t *it = &s_coopItems[i];
+        const char *v;
+        char        num[8], key[16];
+        float       tw, tx, ty;
+        int         n;
+
+        if (!it->cv) {
+            it->cv = cgi.Cvar_Get(it->cvarName, "", 0);
+        }
+        v = it->cv->string;
+        if (!v[0] || v[0] == '-') {
+            continue;
+        }
+        if (!it->hShader) {
+            it->hShader = cgi.R_RegisterShaderNoMip(it->shaderName);
+        }
+
+        // icon
+        c[0] = c[1] = c[2] = 1.0f;
+        c[3]                = 0.92f;
+        cgi.R_SetColor(c);
+        cgi.R_DrawStretchPic(xPx, topPx, iconPx, iconPx, 0.0f, 0.0f, 1.0f, 1.0f, it->hShader);
+
+        // amount: a subscript - starts at the icon's right edge, sits half a line below its bottom edge
+        Q_strncpyz(num, v, sizeof(num));
+        for (n = 0; num[n]; n++) {
+            if (num[n] < '0' || num[n] > '9') {
+                num[n] = 0; // digits only: this text came from a server
+                break;
+            }
+        }
+        if (num[0]) {
+            tx = (xPx + iconPx - 1.0f) / sx;
+            ty = (topPx + iconPx - textH * 0.55f) / sy;
+            c[0] = c[1] = c[2] = 0.0f;
+            c[3]                = 0.85f;
+            cgi.R_SetColor(c);
+            cgi.R_DrawString(font, num, tx + 1.0f, ty + 1.0f, -1, cgs.uiHiResScale);
+            c[0] = c[1] = c[2] = (num[0] == '0' && !num[1]) ? 0.62f : 1.0f; // an empty slot reads dimmer
+            c[3]                = 0.95f;
+            cgi.R_SetColor(c);
+            cgi.R_DrawString(font, num, tx, ty, -1, cgs.uiHiResScale);
+        }
+
+        // bound key: centred under the icon, cut to the column so it can never touch the next one
+        Q_strncpyz(key, it->key, sizeof(key));
+        n = (int)strlen(key);
+        while (n > 0 && CG_FeedTextW(key, -1) * sx > pitchPx - 4.0f) {
+            key[--n] = 0;
+        }
+        if (key[0]) {
+            tw = CG_FeedTextW(key, -1);
+            tx = (xPx + iconPx * 0.5f) / sx - tw * 0.5f;
+            if (tx * sx < 2.0f) {
+                tx = 2.0f / sx;
+            }
+            ty = (topPx + iconPx + textH * 0.50f) / sy;
+            c[0] = c[1] = c[2] = 0.0f;
+            c[3]                = 0.70f;
+            cgi.R_SetColor(c);
+            cgi.R_DrawString(font, key, tx + 1.0f, ty + 1.0f, -1, cgs.uiHiResScale);
+            c[0] = 0.80f;
+            c[1] = 0.76f;
+            c[2] = 0.62f;
+            c[3] = 0.78f;
+            cgi.R_SetColor(c);
+            cgi.R_DrawString(font, key, tx, ty, -1, cgs.uiHiResScale);
+        }
+
+        xPx += pitchPx;
+        shown++;
+    }
+    if (shown) {
+        cgi.R_SetColor(NULL);
+    }
+}
+
 void CG_DrawCoopFeed(qboolean cineHide)
 {
     static const float tick[5][3] = {
@@ -563,6 +807,7 @@ void CG_DrawCoopFeed(qboolean cineHide)
     CG_CoopFeedInit();
     CG_CoopScoreHudMirror();
     if (!cineHide) {
+        CG_DrawCoopItems();         // [bug-3495] medkit / sandbag / ammo box: icon, subscript amount, bound key
         CG_DrawCoopPinned();        // [bug-3485] not part of the feed: coop_feed 0 does not hide it
     }
     now = cg.time;
@@ -628,6 +873,14 @@ void CG_DrawCoopFeed(qboolean cineHide)
     x0     = s_cvX->value;
     // bottom edge in feed units: coop_feedYv virtual-480 units above the bottom of the screen (see CG_CoopFeedInit)
     bottom = ((float)cgs.glconfig.vidHeight - s_cvY->value * ((float)cgs.glconfig.vidHeight / 480.0f)) / sy;
+    // [bug-3495] on a small screen the item row is lifted clear of the team badge: the feed stays above it
+    {
+        float itemsTop = (CG_CoopItemsTopPx(NULL) - 4.0f) / sy;
+
+        if (bottom > itemsTop) {
+            bottom = itemsTop;
+        }
+    }
 
     // newest at the bottom: walk newest -> oldest, stacking upward
     target = 0.0f;
