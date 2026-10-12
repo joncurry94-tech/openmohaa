@@ -20,6 +20,13 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 // tr_vbo.c
+// HZM gl2 [render-perf 3] SDL_GL_GetProcAddress / SDL_GL_ExtensionSupported for the mapped tess stream
+#ifdef USE_INTERNAL_SDL_HEADERS
+#	include "SDL.h"
+#else
+#	include <SDL.h>
+#endif
+
 #include "tr_local.h"
 
 
@@ -440,6 +447,278 @@ static int s_tessDrawBaseV, s_tessDrawFirstI;	// where the batch being drawn liv
 
 /*
 ============
+HZM gl2 [render-perf 3] THE MAPPED TESS STREAM
+
+After the ring (bug-3483) every dynamic batch still cost one glBufferSubData per vertex attribute plus one for the
+indexes - four to eight driver calls a batch, a couple of thousand batches a frame on Omaha, each of them taking the
+driver's lock and copying the data into its command queue. With GL 4.4 buffer storage the buffer is mapped ONCE,
+persistently, and a batch is written with plain memcpy: no driver call at all until the draw.
+
+A persistent buffer cannot be orphaned, so "is the GPU still reading this?" is answered with fences instead. The
+store is r_hzmTessMapSegs segments (64; latched, 16..256) of HZM_TESS_MAP_SEGBATCH full batches each, about 1.2 MB
+a segment, filled in a circle. 64 segments hold a little over one Omaha frame (~950,000 vertices). The first batch
+of every frame drops ONE fence behind everything drawn so far, and every segment written in the frame before is
+recorded as covered by it. Before a segment is written again its fence must have signalled; normally that was two
+or more frames ago and the answer is already known, so the whole scheme costs one glFenceSync and about one
+zero-timeout glClientWaitSync a frame. If the GPU really is that far behind - or one frame goes all the way round
+the store - this waits for it (counted: RPSTAT "stalls"); nothing the GPU may still read is ever overwritten.
+
+It is a SECOND vertex array object beside the classic tess VAO, with the same attribute layout over a larger
+buffer, so the two paths can be switched live: tess.vao simply points at one or the other, chosen per batch in
+RB_UpdateTessVao (r_hzmTessMap 0 = the classic ring). Each VAO keeps its own record of which arrays are enabled.
+No buffer storage / sync objects / VAOs / base-vertex draws: the mapped VAO is never created and nothing changes.
+============
+*/
+#define HZM_TESS_MAP_SEGS_MAX	256
+#define HZM_TESS_MAP_SEGBATCH	8
+#define HZM_TESS_MAP_FENCES		8
+#define HZM_TESS_SEG_FREE		0		// never written, or its fence is known to have signalled
+#define HZM_TESS_SEG_PENDING	-1		// written this frame: the next frame's fence will cover it
+
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT					0x0002
+#endif
+#ifndef GL_MAP_PERSISTENT_BIT
+#define GL_MAP_PERSISTENT_BIT				0x0040
+#endif
+#ifndef GL_MAP_COHERENT_BIT
+#define GL_MAP_COHERENT_BIT					0x0080
+#endif
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE		0x9117
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#define GL_SYNC_FLUSH_COMMANDS_BIT			0x00000001
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#define GL_TIMEOUT_EXPIRED					0x911B
+#endif
+
+typedef void (APIENTRY *hzmBufferStorage_t)(GLenum target, ptrdiff_t size, const void *data, GLbitfield flags);
+typedef void *(APIENTRY *hzmMapBufferRange_t)(GLenum target, ptrdiff_t offset, ptrdiff_t length, GLbitfield access);
+typedef void *(APIENTRY *hzmFenceSync_t)(GLenum condition, GLbitfield flags);
+typedef GLenum (APIENTRY *hzmClientWaitSync_t)(void *sync, GLbitfield flags, uint64_t timeout);
+typedef void (APIENTRY *hzmDeleteSync_t)(void *sync);
+
+static hzmBufferStorage_t	qglBufferStorageHzm;
+static hzmMapBufferRange_t	qglMapBufferRangeHzm;
+static hzmFenceSync_t		qglFenceSyncHzm;
+static hzmClientWaitSync_t	qglClientWaitSyncHzm;
+static hzmDeleteSync_t		qglDeleteSyncHzm;
+
+cvar_t *r_hzmTessMap;
+
+static vao_t	*s_tessClassicVao, *s_tessMapVao;
+static uint32_t	s_tessVaoEnabled[2];		// vertexAttribsEnabled of [classic, mapped] while it is not the live one
+static byte		*s_tessMapV, *s_tessMapI;	// the mapped vertex / index store
+static int		s_tessMapSegVerts, s_tessMapSegIndexes;
+static int		s_tessMapSeg;
+static int		s_tessMapCurV, s_tessMapCurI;
+static int		s_tessMapSegs;				// segments in the store (r_hzmTessMapSegs when it was created)
+static int		s_tessMapSegFence[HZM_TESS_MAP_SEGS_MAX];	// FREE, PENDING, or the sequence number of the covering fence
+static void		*s_tessMapFence[HZM_TESS_MAP_FENCES];	// fence number n lives in slot n % HZM_TESS_MAP_FENCES
+static int		s_tessMapFenceSeq;			// number of the newest fence (they start at 1)
+static int		s_tessMapFenceDone;			// every fence up to this number has signalled
+static int		s_tessMapFrame;
+
+static void R_TessMapCreate(void)
+{
+	vao_t	*vao;
+	int		attribIndex, offset, totalVerts, totalIndexes, vertexesSize, indexesSize;
+	GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+
+	s_tessMapVao = NULL;
+	s_tessMapV = s_tessMapI = NULL;
+	memset(s_tessMapFence, 0, sizeof(s_tessMapFence));
+	memset(s_tessMapSegFence, 0, sizeof(s_tessMapSegFence));
+	s_tessMapSeg = 0;
+	s_tessMapCurV = s_tessMapCurI = 0;
+	s_tessMapFenceSeq = s_tessMapFenceDone = 0;
+	s_tessMapFrame = -1;
+
+	qglBufferStorageHzm = (hzmBufferStorage_t)SDL_GL_GetProcAddress("glBufferStorage");
+	qglMapBufferRangeHzm = (hzmMapBufferRange_t)SDL_GL_GetProcAddress("glMapBufferRange");
+	qglFenceSyncHzm = (hzmFenceSync_t)SDL_GL_GetProcAddress("glFenceSync");
+	qglClientWaitSyncHzm = (hzmClientWaitSync_t)SDL_GL_GetProcAddress("glClientWaitSync");
+	qglDeleteSyncHzm = (hzmDeleteSync_t)SDL_GL_GetProcAddress("glDeleteSync");
+
+	if (!qglBufferStorageHzm || !qglMapBufferRangeHzm || !qglFenceSyncHzm || !qglClientWaitSyncHzm || !qglDeleteSyncHzm
+		|| !qglDrawElementsBaseVertex || !glRefConfig.vertexArrayObject
+		|| !SDL_GL_ExtensionSupported("GL_ARB_buffer_storage") || tr.numVaos == MAX_VAOS) {
+		ri.Printf(PRINT_ALL, "...mapped tess stream: not available\n");
+		return;
+	}
+
+	s_tessMapSegVerts = SHADER_MAX_VERTEXES * HZM_TESS_MAP_SEGBATCH;
+	s_tessMapSegIndexes = SHADER_MAX_INDEXES * HZM_TESS_MAP_SEGBATCH;
+	s_tessMapSegs = ri.Cvar_Get("r_hzmTessMapSegs", "64", CVAR_LATCH)->integer;
+	if (s_tessMapSegs < 16) {
+		s_tessMapSegs = 16;
+	} else if (s_tessMapSegs > HZM_TESS_MAP_SEGS_MAX) {
+		s_tessMapSegs = HZM_TESS_MAP_SEGS_MAX;
+	}
+	totalVerts = s_tessMapSegVerts * s_tessMapSegs;
+	totalIndexes = s_tessMapSegIndexes * s_tessMapSegs;
+
+	vao = tr.vaos[tr.numVaos] = ri.Hunk_Alloc(sizeof(*vao), h_low);
+	tr.numVaos++;
+	memset(vao, 0, sizeof(*vao));
+	Q_strncpyz(vao->name, "tessVertexArray_mapped", sizeof(vao->name));
+
+	// the classic VAO's layout - one region per attribute - over the larger vertex count
+	offset = 0;
+	for (attribIndex = 0; attribIndex < ATTR_INDEX_COUNT; attribIndex++) {
+		vao->attribs[attribIndex] = s_tessClassicVao->attribs[attribIndex];
+		vao->attribs[attribIndex].offset = offset;
+		if (vao->attribs[attribIndex].enabled) {
+			offset += vao->attribs[attribIndex].stride * totalVerts;
+		}
+	}
+	vertexesSize = offset;
+	indexesSize = sizeof(tess.indexes[0]) * totalIndexes;
+
+	qglGenVertexArrays(1, &vao->vao);
+	qglBindVertexArray(vao->vao);
+
+	vao->vertexesSize = vertexesSize;
+	qglGenBuffers(1, &vao->vertexesVBO);
+	qglBindBuffer(GL_ARRAY_BUFFER, vao->vertexesVBO);
+	qglBufferStorageHzm(GL_ARRAY_BUFFER, vertexesSize, NULL, flags);
+	s_tessMapV = (byte *)qglMapBufferRangeHzm(GL_ARRAY_BUFFER, 0, vertexesSize, flags);
+
+	vao->indexesSize = indexesSize;
+	qglGenBuffers(1, &vao->indexesIBO);
+	qglBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vao->indexesIBO);
+	qglBufferStorageHzm(GL_ELEMENT_ARRAY_BUFFER, indexesSize, NULL, flags);
+	s_tessMapI = (byte *)qglMapBufferRangeHzm(GL_ELEMENT_ARRAY_BUFFER, 0, indexesSize, flags);
+
+	glState.currentVao = vao;
+
+	// pointers + all arrays enabled, without touching the classic VAO's record of its own enables
+	for (attribIndex = 0; attribIndex < ATTR_INDEX_COUNT; attribIndex++) {
+		vaoAttrib_t *vAtb = &vao->attribs[attribIndex];
+
+		if (vAtb->enabled) {
+			qglVertexAttribPointer(attribIndex, vAtb->count, vAtb->type, vAtb->normalized, vAtb->stride, BUFFER_OFFSET(vAtb->offset));
+			qglEnableVertexAttribArray(attribIndex);
+			s_tessVaoEnabled[1] |= 1u << attribIndex;
+		}
+	}
+
+	// swallow any error from the calls above: a failure means "no mapped stream", never a broken renderer
+	while (qglGetError() != GL_NO_ERROR) {
+		s_tessMapV = NULL;
+	}
+	if (!s_tessMapV || !s_tessMapI) {
+		ri.Printf(PRINT_ALL, "...mapped tess stream: buffer storage failed, staying on the classic stream\n");
+		s_tessMapV = s_tessMapI = NULL;
+		return;		// the VAO stays in tr.vaos so R_ShutdownVaos frees what was made
+	}
+	s_tessMapVao = vao;
+	ri.Printf(PRINT_ALL, "...mapped tess stream: %d segments x %d vertices, %d MB\n", s_tessMapSegs, s_tessMapSegVerts,
+		(vertexesSize + indexesSize) / (1024 * 1024));
+}
+
+/*
+R_TessMapSelect - point tess.vao at the classic or the mapped VAO (between batches only: called from
+RB_UpdateTessVao before it binds), carrying each one's enabled-array record across the switch
+*/
+static qboolean R_TessMapSelect(void)
+{
+	qboolean wantMap = (qboolean)(s_tessMapVao && r_hzmTessMap->integer && r_hzmTessStream->integer);
+	vao_t	*want = wantMap ? s_tessMapVao : s_tessClassicVao;
+
+	if (tess.vao != want) {
+		s_tessVaoEnabled[tess.vao == s_tessMapVao ? 1 : 0] = glState.vertexAttribsEnabled;
+		tess.vao = want;
+		glState.vertexAttribsEnabled = s_tessVaoEnabled[wantMap ? 1 : 0];
+	}
+	return wantMap;
+}
+
+/*
+R_TessMapWaitFence - fence number seq (and with it every older one) has signalled when this returns
+*/
+static void R_TessMapWaitFence(int seq)
+{
+	void *f;
+
+	if (seq <= s_tessMapFenceSeq - HZM_TESS_MAP_FENCES) {
+		// so old that its slot has been reused: the oldest fence still held was dropped after it, so that one
+		// having signalled proves this one has
+		seq = s_tessMapFenceSeq - HZM_TESS_MAP_FENCES + 1;
+	}
+	if (seq <= s_tessMapFenceDone) {
+		return;
+	}
+	f = s_tessMapFence[seq % HZM_TESS_MAP_FENCES];
+	if (f && qglClientWaitSyncHzm(f, 0, 0) == GL_TIMEOUT_EXPIRED) {
+		int tries = 0;
+
+		hzmPerf.tessStalls++;
+		while (qglClientWaitSyncHzm(f, GL_SYNC_FLUSH_COMMANDS_BIT, 50000000) == GL_TIMEOUT_EXPIRED && ++tries < 40) {
+		}
+	}
+	s_tessMapFenceDone = seq;
+}
+
+/*
+R_TessMapNewFence - one fence behind everything drawn so far; every PENDING segment is covered by it
+*/
+static void R_TessMapNewFence(void)
+{
+	int i, slot;
+
+	s_tessMapFenceSeq++;
+	slot = s_tessMapFenceSeq % HZM_TESS_MAP_FENCES;
+	if (s_tessMapFence[slot]) {
+		qglDeleteSyncHzm(s_tessMapFence[slot]);
+	}
+	s_tessMapFence[slot] = qglFenceSyncHzm(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	for (i = 0; i < s_tessMapSegs; i++) {
+		if (s_tessMapSegFence[i] == HZM_TESS_SEG_PENDING) {
+			s_tessMapSegFence[i] = s_tessMapFenceSeq;
+		}
+	}
+}
+
+/*
+R_TessMapPlace - where the batch of numVerts / numIndexes goes in the mapped store
+*/
+static void R_TessMapPlace(int numVerts, int numIndexes, int *baseV, int *baseI)
+{
+	int seg = s_tessMapSeg;
+
+	if (s_tessMapFrame != tr.frameCount) {
+		s_tessMapFrame = tr.frameCount;
+		R_TessMapNewFence();	// behind every draw of the frames before this one
+	}
+
+	if (s_tessMapCurV + numVerts > (seg + 1) * s_tessMapSegVerts
+		|| s_tessMapCurI + numIndexes > (seg + 1) * s_tessMapSegIndexes) {
+		seg = (seg + 1) % s_tessMapSegs;
+		if (s_tessMapSegFence[seg] == HZM_TESS_SEG_PENDING) {
+			// all the way round the store inside one frame: fence what has been drawn and wait for it
+			R_TessMapNewFence();
+		}
+		if (s_tessMapSegFence[seg] > 0) {
+			R_TessMapWaitFence(s_tessMapSegFence[seg]);
+		}
+		s_tessMapSeg = seg;
+		s_tessMapCurV = seg * s_tessMapSegVerts;
+		s_tessMapCurI = seg * s_tessMapSegIndexes;
+	}
+	// the part of the current segment behind the cursor was drawn from in this frame (or is covered by this
+	// frame's fence); writing past the cursor never touches it
+	s_tessMapSegFence[seg] = HZM_TESS_SEG_PENDING;
+	*baseV = s_tessMapCurV;
+	*baseI = s_tessMapCurI;
+	s_tessMapCurV += numVerts;
+	s_tessMapCurI += numIndexes;
+}
+
+/*
+============
 R_TessStreamDraw
 
 qtrue = drawn. Only for the tess VAO, and only while the batch in it was written at a non-zero base.
@@ -555,6 +834,13 @@ void R_InitVaos(void)
 
 	Vao_SetVertexPointers(tess.vao);
 
+	// HZM gl2 [render-perf 3] the mapped twin of the tess VAO (see THE MAPPED TESS STREAM)
+	r_hzmTessMap = ri.Cvar_Get("r_hzmTessMap", "1", 0);
+	s_tessClassicVao = tess.vao;
+	s_tessVaoEnabled[0] = glState.vertexAttribsEnabled;
+	s_tessVaoEnabled[1] = 0;
+	R_TessMapCreate();
+
 	R_BindNullVao();
 
 	VaoCache_Init();
@@ -575,6 +861,21 @@ void R_ShutdownVaos(void)
 	ri.Printf(PRINT_ALL, "------- R_ShutdownVaos -------\n");
 
 	R_BindNullVao();
+
+	// HZM gl2 [render-perf 3] the mapped stream's fences; its buffers go with the VAO list below (deleting unmaps)
+	if (qglDeleteSyncHzm) {
+		for (i = 0; i < HZM_TESS_MAP_FENCES; i++) {
+			if (s_tessMapFence[i]) {
+				qglDeleteSyncHzm(s_tessMapFence[i]);
+				s_tessMapFence[i] = NULL;
+			}
+		}
+	}
+	if (s_tessClassicVao) {
+		tess.vao = s_tessClassicVao;
+	}
+	s_tessMapVao = NULL;
+	s_tessMapV = s_tessMapI = NULL;
 
 	for(i = 0; i < tr.numVaos; i++)
 	{
@@ -662,10 +963,50 @@ void RB_UpdateTessVao(unsigned int attribBits)
 		int attribUpload;
 		int baseV = 0, baseI = 0;
 		qboolean stream = (qboolean)(s_tessStreamVerts > SHADER_MAX_VERTEXES && r_hzmTessStream->integer);
+		qboolean mapped = R_TessMapSelect();	// HZM gl2 [render-perf 3] may repoint tess.vao
 
 		R_BindVao(tess.vao);
 		hzmPerf.tessBatches++;
 		hzmPerf.tessVerts += tess.numVertexes;
+
+		if (mapped) {
+			// HZM gl2 [render-perf 3] written straight into the mapped store: no driver call until the draw
+			R_TessMapPlace(tess.numVertexes, tess.numIndexes, &baseV, &baseI);
+			s_tessDrawBaseV = baseV;
+			s_tessDrawFirstI = baseI;
+
+			if(!(attribBits & ATTR_BITS))
+				attribBits = ATTR_BITS;
+
+			for (attribIndex = 0; attribIndex < ATTR_INDEX_COUNT; attribIndex++)
+			{
+				uint32_t attribBit = 1 << attribIndex;
+				vaoAttrib_t *vAtb = &tess.vao->attribs[attribIndex];
+
+				if (attribBits & attribBit)
+				{
+					if (vAtb->stride && tess.attribPointers[attribIndex])
+					{
+						memcpy(s_tessMapV + vAtb->offset + (size_t)baseV * vAtb->stride, tess.attribPointers[attribIndex],
+							(size_t)tess.numVertexes * vAtb->stride);
+						hzmPerf.tessBytes += (double)(tess.numVertexes * vAtb->stride);
+					}
+
+					if (!(glState.vertexAttribsEnabled & attribBit))
+					{
+						qglEnableVertexAttribArray(attribIndex);
+						glState.vertexAttribsEnabled |= attribBit;
+					}
+				}
+				else if (glState.vertexAttribsEnabled & attribBit)
+				{
+					qglDisableVertexAttribArray(attribIndex);
+					glState.vertexAttribsEnabled &= ~attribBit;
+				}
+			}
+			memcpy(s_tessMapI + (size_t)baseI * sizeof(tess.indexes[0]), tess.indexes, (size_t)tess.numIndexes * sizeof(tess.indexes[0]));
+			return;
+		}
 
 		if (stream && s_tessCursorV + tess.numVertexes <= s_tessStreamVerts
 			&& s_tessCursorI + tess.numIndexes <= s_tessStreamIndexes) {
