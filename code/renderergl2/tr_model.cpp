@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_local.h"
 #include "tiki.h"
 #include <vector.h>
+#include <emmintrin.h>   // HZM gl2 [render-perf 6] SSE2 colour widen in RB_StaticMesh
 
 #define LL(x) x = LittleLong(x)
 
@@ -2070,6 +2071,8 @@ static int        s_skcBytes;
 static int        s_skcHit, s_skcMiss, s_skcStore, s_skcStatFrame;
 static cvar_t    *r_hzmSkelCache;
 
+static void SMC_Flush(void);     // [render-perf 6] below
+
 extern "C" void R_SkelCacheFlush(void)
 {
     int i;
@@ -2081,6 +2084,7 @@ extern "C" void R_SkelCacheFlush(void)
     }
     memset(s_skc, 0, sizeof(s_skc));
     s_skcBytes = 0;
+    SMC_Flush();    // [render-perf 6] the packed static-model streams are keyed by surface pointers too
 }
 
 static uint64_t SKC_HashBones(const skelBoneCache_t *bones, int numBones)
@@ -2253,9 +2257,106 @@ static void SKC_StoreFrom(skcEntry_t *e, const byte *src, int rc)
     memcpy(e->data, src, rc * (int)SKC_VERT_BYTES);
     e->valid = qtrue;
     s_skcStore++;
+}
+
+/*
+=============
+HZM gl2 [render-perf 6] PACKING WITHOUT A CALL PER VERTEX
+
+R_VaoPackNormal lives in tr_vbo.c, so every skinned vertex and every static-model vertex paid a function call into
+another translation unit for three multiplies (3.6 % of the main thread on Omaha, and the same again on the skinning
+workers). SKEL_PACK_NORMAL is the same arithmetic, expression for expression, written where the compiler can see it -
+the result is bit-identical. r_hzmFastPack 0 = the call, as before (live); 2 = verify the static-model part
 against the old loops, vertex by vertex (counted by r_hzmPerfStats).
 
 Static models: a surface's normals, texture and lightmap coordinates never change, so they are packed / split once
+per surface (SMC_Get) and copied from then on; its baked colours go through one SSE2 widen (x * 257, which is what
+x * 0xffff / 0xff is) instead of four integer divides a vertex. Also bit-identical.
+=============
+*/
+static cvar_t *r_hzmFastPack;
+static int     s_fastPack;      // read by the skinning workers too: a plain int, latched once per frame
+
+static ID_INLINE void SKEL_PackNormalInline(int16_t *out, const float *v)
+{
+    out[0] = v[0] * 32767.0f + (v[0] > 0.0f ? 0.5f : -0.5f);
+    out[1] = v[1] * 32767.0f + (v[1] > 0.0f ? 0.5f : -0.5f);
+    out[2] = v[2] * 32767.0f + (v[2] > 0.0f ? 0.5f : -0.5f);
+    out[3] = 0;
+}
+
+#define SKEL_PACK_NORMAL(o, n)               \
+    do {                                     \
+        if (s_fastPack) {                    \
+            SKEL_PackNormalInline((o), (n)); \
+        } else {                             \
+            R_VaoPackNormal((o), (n));       \
+        }                                    \
+    } while (0)
+
+static void SKEL_FastPackLatch(void)
+{
+    if (!r_hzmFastPack) {
+        r_hzmFastPack = ri.Cvar_Get("r_hzmFastPack", "1", 0);
+    }
+    s_fastPack = r_hzmFastPack->integer;
+}
+
+#define SMC_SLOTS 4096
+
+typedef struct {
+    skelSurfaceGame_t *surf;
+    int                numVerts;
+    int16_t          (*normal)[4];
+    vec2_t            *tc;
+    vec2_t            *lc;
+} smcEntry_t;
+
+static smcEntry_t s_smc[SMC_SLOTS];
+
+static void SMC_Flush(void)
+{
+    int i;
+
+    for (i = 0; i < SMC_SLOTS; i++) {
+        free(s_smc[i].normal);      // one block: normal | tc | lc
+    }
+    memset(s_smc, 0, sizeof(s_smc));
+}
+
+static smcEntry_t *SMC_Get(skelSurfaceGame_t *surf)
+{
+    unsigned int idx = (unsigned int)((uintptr_t)surf >> 4) * 2654435761u;
+    int          p, j;
+
+    for (p = 0; p < 16; p++) {
+        smcEntry_t *e = &s_smc[(idx + p) & (SMC_SLOTS - 1)];
+
+        if (e->surf == surf) {
+            return e->numVerts == surf->numVerts ? e : NULL;
+        }
+        if (!e->surf) {
+            byte *blk = (byte *)malloc(surf->numVerts * (4 * sizeof(int16_t) + 2 * sizeof(vec2_t)));
+
+            if (!blk) {
+                return NULL;
+            }
+            e->normal = (int16_t(*)[4])blk;
+            e->tc     = (vec2_t *)(blk + surf->numVerts * 4 * sizeof(int16_t));
+            e->lc     = e->tc + surf->numVerts;
+            for (j = 0; j < surf->numVerts; j++) {
+                R_VaoPackNormal(e->normal[j], surf->pStaticNormal[j]);
+                e->tc[j][0] = surf->pStaticTexCoords[j][0][0];
+                e->tc[j][1] = surf->pStaticTexCoords[j][0][1];
+                e->lc[j][0] = surf->pStaticTexCoords[j][1][0];
+                e->lc[j][1] = surf->pStaticTexCoords[j][1][1];
+            }
+            e->numVerts = surf->numVerts;
+            e->surf     = surf;
+            return e;
+        }
+    }
+    return NULL;
 }
 
 /*
@@ -2332,7 +2433,7 @@ static void SKEL_Skin(skelSurfaceGame_t *sf, dtiki_t *tiki, skelHeaderGame_t *sk
                     weight++;
                 }
 
-                R_VaoPackNormal(outNormal, normal);
+                SKEL_PACK_NORMAL(outNormal, normal);
                 VectorScale(out, scale, outXyz);
 
                 outTc[vertNum * 2] = newVerts->texCoords[0];
@@ -2389,7 +2490,7 @@ static void SKEL_Skin(skelSurfaceGame_t *sf, dtiki_t *tiki, skelHeaderGame_t *sk
                     weight++;
                 }
 
-                R_VaoPackNormal(outNormal, normal);
+                SKEL_PACK_NORMAL(outNormal, normal);
                 VectorScale(out, scale, outXyz);
 
                 outTc[vertNum * 2] = newVerts->texCoords[0];
@@ -2433,7 +2534,7 @@ static void SKEL_Skin(skelSurfaceGame_t *sf, dtiki_t *tiki, skelHeaderGame_t *sk
                     weight++;
                 }
 
-                R_VaoPackNormal(outNormal, normal);
+                SKEL_PACK_NORMAL(outNormal, normal);
                 VectorScale(out, scale, outXyz);
 
                 outTc[vertNum * 2] = newVerts->texCoords[0];
@@ -2468,7 +2569,7 @@ static void SKEL_Skin(skelSurfaceGame_t *sf, dtiki_t *tiki, skelHeaderGame_t *sk
                     weight++;
                 }
 
-                R_VaoPackNormal(outNormal, normal);
+                SKEL_PACK_NORMAL(outNormal, normal);
                 VectorScale(out, scale, outXyz);
 
                 outTc[vertNum * 2] = newVerts->texCoords[0];
@@ -2798,6 +2899,7 @@ extern "C" void R_SkelPreskin(drawSurf_t *drawSurfs, int numDrawSurfs)
     int         workers = PS_WantedWorkers();
     int         i, numJobs = 0;
 
+    SKEL_FastPackLatch();   // [render-perf 6] before any worker runs
     if (!workers || (lod_tool && lod_tool->integer) || !r_drawentitypoly->integer) {
         return;
     }
@@ -3430,19 +3532,66 @@ void RB_StaticMesh(staticSurface_t *staticSurf)
     }
 
     hzmPerf.staticSurfs++;
-    for (j = 0; j < render_count; j++) {
-        Vector4Copy(surf->pStaticXyz[j], tess.xyz[baseVertex + j]);
-        // HZM gl2 re-port (bug-gl2-modellight): pStaticNormal is float, gl2's
-        // tess.normal is int16-packed - the old Vector4Copy truncated unit
-        // normals to 0/1, breaking any per-vertex lighting on static models
-        R_VaoPackNormal(tess.normal[baseVertex + j], surf->pStaticNormal[j]);
-        tess.texCoords[baseVertex + j][0]   = surf->pStaticTexCoords[j][0][0];
-        tess.texCoords[baseVertex + j][1]   = surf->pStaticTexCoords[j][0][1];
-        tess.lightCoords[baseVertex + j][0] = surf->pStaticTexCoords[j][1][0];
-        tess.lightCoords[baseVertex + j][1] = surf->pStaticTexCoords[j][1][1];
+    SKEL_FastPackLatch();
+    // HZM gl2 [render-perf 6] the streams of a static surface never change: packed / split once, copied after that
+    smcEntry_t *smc = s_fastPack ? SMC_Get(surf) : NULL;
+    if (smc) {
+        memcpy(tess.xyz[baseVertex], surf->pStaticXyz, render_count * sizeof(vec4_t));
+        memcpy(tess.normal[baseVertex], smc->normal, render_count * 4 * sizeof(int16_t));
+        memcpy(tess.texCoords[baseVertex], smc->tc, render_count * sizeof(vec2_t));
+        memcpy(tess.lightCoords[baseVertex], smc->lc, render_count * sizeof(vec2_t));
+    } else {
+        for (j = 0; j < render_count; j++) {
+            Vector4Copy(surf->pStaticXyz[j], tess.xyz[baseVertex + j]);
+            // HZM gl2 re-port (bug-gl2-modellight): pStaticNormal is float, gl2's
+            // tess.normal is int16-packed - the old Vector4Copy truncated unit
+            // normals to 0/1, breaking any per-vertex lighting on static models
+            R_VaoPackNormal(tess.normal[baseVertex + j], surf->pStaticNormal[j]);
+            tess.texCoords[baseVertex + j][0]   = surf->pStaticTexCoords[j][0][0];
+            tess.texCoords[baseVertex + j][1]   = surf->pStaticTexCoords[j][0][1];
+            tess.lightCoords[baseVertex + j][0] = surf->pStaticTexCoords[j][1][0];
+            tess.lightCoords[baseVertex + j][1] = surf->pStaticTexCoords[j][1][1];
+        }
     }
 
-    if (backEndData->staticModelData) {
+    if (backEndData->staticModelData && smc) {
+        const size_t offset =
+            backEnd.currentStaticModel->firstVertexData + staticSurf->ofsStaticData * sizeof(color4ub_t);
+        const byte  *in8   = (const byte *)&backEndData->staticModelData[offset];
+        uint16_t    *out16 = &tess.color[baseVertex][0];
+        int          n     = render_count * 4;
+
+        // x * 0xffff / 0xff == x * 257 == the byte repeated in both halves of the 16-bit value
+        for (i = 0; i + 16 <= n; i += 16) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(in8 + i));
+            _mm_storeu_si128((__m128i *)(out16 + i), _mm_unpacklo_epi8(v, v));
+            _mm_storeu_si128((__m128i *)(out16 + i + 8), _mm_unpackhi_epi8(v, v));
+        }
+        for (; i < n; i++) {
+            out16[i] = (uint16_t)(in8[i] * 257);
+        }
+        if (s_fastPack == 2) {
+            // verify: the copied streams and the widened colours against what the old loops produce
+            qboolean bad = qfalse;
+
+            for (i = 0; i < n && !bad; i++) {
+                bad = (qboolean)(out16[i] != (uint16_t)(in8[i] * 0xffff / 0xff));
+            }
+            for (j = 0; j < render_count && !bad; j++) {
+                int16_t pk[4];
+
+                R_VaoPackNormal(pk, surf->pStaticNormal[j]);
+                bad = (qboolean)(memcmp(pk, tess.normal[baseVertex + j], sizeof(pk))
+                                 || memcmp(surf->pStaticXyz[j], tess.xyz[baseVertex + j], sizeof(vec4_t))
+                                 || tess.texCoords[baseVertex + j][0] != surf->pStaticTexCoords[j][0][0]
+                                 || tess.texCoords[baseVertex + j][1] != surf->pStaticTexCoords[j][0][1]
+                                 || tess.lightCoords[baseVertex + j][0] != surf->pStaticTexCoords[j][1][0]
+                                 || tess.lightCoords[baseVertex + j][1] != surf->pStaticTexCoords[j][1][1]);
+            }
+            hzmPerf.verifyPack++;
+            hzmPerf.verifyPackBad += bad;
+        }
+    } else if (backEndData->staticModelData) {
         const size_t offset =
             backEnd.currentStaticModel->firstVertexData + staticSurf->ofsStaticData * sizeof(color4ub_t);
         assert(offset < tr.world->numStaticModelData * sizeof(color4ub_t));
