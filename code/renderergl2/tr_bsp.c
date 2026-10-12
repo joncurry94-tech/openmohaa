@@ -3536,6 +3536,7 @@ void RE_LoadWorldMap( const char *name ) {
 	// staleness test snaps after 500 ms, but a map load recycles entity numbers onto entirely
 	// different objects and can land inside that window, so clear outright rather than rely on it.
 	R_CoopResetEntityLightSmoothing();
+	R_LightDirCacheFlush();	// HZM gl2 [render-perf 4] and every remembered light direction
 
 	// set default map light scale
 	tr.sunShadowScale = 0.5f;

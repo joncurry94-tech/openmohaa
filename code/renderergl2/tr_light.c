@@ -1493,12 +1493,124 @@ static int R_LightDirForPointEx( vec3_t point, vec3_t lightDir, vec3_t normal, w
 	return qtrue;
 }
 
+/*
+===============
+HZM gl2 [render-perf 4] THE LIGHT-DIRECTION MEMO
+
+R_LightDirForPoint is a world query: find the leaf, then one collision trace to every map light in it and one to
+the sun. It is asked the same question every frame - on the Omaha maps once per terrain patch per pass, always from
+the patch's fixed centre point (the bug-2905 path), and for every entity that has not moved.
+
+The answer is a pure function of the point, the normal handed in, the map (its lights and its solid world: the
+trace runs against the world model only) and the view's area mask (a light in a closed-off area is skipped). So it
+is kept per (point, normal, area mask): same question, same answer, no trace. The sun and the map are part of a
+generation number - any change, and a map load (R_LightDirCacheFlush), empties the memo.
+
+r_hzmLightDirMemo 0 = always ask the world (live). 2 = verify: every answer from the memo is also asked of the
 world and compared bit for bit (counted by r_hzmPerfStats; the differing count has to stay 0).
 ===============
 */
+#define LDC_SLOTS	8192
+
+typedef struct {
+	vec3_t		point;
+	vec3_t		normal;
+	unsigned	maskHash;
+	int			gen;
+	int			ret;
+	vec3_t		dir;
+} ldcEntry_t;
+
+static ldcEntry_t	s_ldc[LDC_SLOTS];
+static int			s_ldcGen = 1;
+static world_t		*s_ldcWorld;
+static void			*s_ldcGrid;
+static vec3_t		s_ldcSunColor, s_ldcSunDir;
+static qboolean		s_ldcSunExists;
+static byte			s_ldcMask[MAX_MAP_AREA_BYTES];
+static unsigned		s_ldcMaskHash;
+static cvar_t		*r_hzmLightDirMemo;
+
+void R_LightDirCacheFlush( void )
+{
+	s_ldcGen++;
+	if ( s_ldcGen <= 0 ) {
+		Com_Memset( s_ldc, 0, sizeof( s_ldc ) );
+		s_ldcGen = 1;
+	}
+	s_ldcWorld = NULL;
+}
+
 int R_LightDirForPoint( vec3_t point, vec3_t lightDir, vec3_t normal, world_t *world )
 {
-	return R_LightDirForPointEx( point, lightDir, normal, world, qtrue, NULL );
+	ldcEntry_t	*e;
+	unsigned	h, w[6];
+	int			i;
+
+	if ( !r_hzmLightDirMemo ) {
+		r_hzmLightDirMemo = ri.Cvar_Get( "r_hzmLightDirMemo", "1", 0 );
+	}
+	if ( !r_hzmLightDirMemo->integer ) {
+		return R_LightDirForPointEx( point, lightDir, normal, world, qtrue, NULL );
+	}
+
+	// the map or the sun changed: a new generation
+	if ( world != s_ldcWorld || (void *)world->lightGridData != s_ldcGrid || s_sun.exists != s_ldcSunExists
+		|| memcmp( s_sun.color, s_ldcSunColor, sizeof( vec3_t ) ) || memcmp( s_sun.direction, s_ldcSunDir, sizeof( vec3_t ) ) ) {
+		R_LightDirCacheFlush();
+		s_ldcWorld = world;
+		s_ldcGrid = (void *)world->lightGridData;
+		s_ldcSunExists = s_sun.exists;
+		VectorCopy( s_sun.color, s_ldcSunColor );
+		VectorCopy( s_sun.direction, s_ldcSunDir );
+		s_ldcMaskHash = 0;
+		Com_Memset( s_ldcMask, 0, sizeof( s_ldcMask ) );
+	}
+	// the area mask the query will read
+	if ( memcmp( backEnd.refdef.areamask, s_ldcMask, sizeof( s_ldcMask ) ) ) {
+		memcpy( s_ldcMask, backEnd.refdef.areamask, sizeof( s_ldcMask ) );
+		s_ldcMaskHash = 2166136261u;
+		for ( i = 0; i < (int)sizeof( s_ldcMask ); i++ ) {
+			s_ldcMaskHash = ( s_ldcMaskHash ^ s_ldcMask[i] ) * 16777619u;
+		}
+	}
+
+	memcpy( w, point, 12 );
+	memcpy( w + 3, normal, 12 );
+	h = s_ldcMaskHash;
+	for ( i = 0; i < 6; i++ ) {
+		h = ( h ^ w[i] ) * 16777619u;
+		h ^= h >> 15;
+	}
+	e = &s_ldc[h & ( LDC_SLOTS - 1 )];
+	if ( e->gen == s_ldcGen && e->maskHash == s_ldcMaskHash && !memcmp( e->point, point, sizeof( vec3_t ) )
+		&& !memcmp( e->normal, normal, sizeof( vec3_t ) ) ) {
+		if ( r_hzmLightDirMemo->integer == 2 ) {
+			vec3_t	real;
+			int		realRet;
+
+			VectorCopy( lightDir, real );
+			realRet = R_LightDirForPointEx( point, real, normal, world, qtrue, NULL );
+			hzmPerf.verifyLightDir++;
+			if ( realRet != e->ret || ( realRet && memcmp( real, e->dir, sizeof( vec3_t ) ) ) ) {
+				hzmPerf.verifyLightDirBad++;
+			}
+		}
+		if ( e->ret ) {
+			VectorCopy( e->dir, lightDir );
+		}
+		return e->ret;
+	}
+
+	e->ret = R_LightDirForPointEx( point, lightDir, normal, world, qtrue, NULL );
+	VectorCopy( point, e->point );
+	VectorCopy( normal, e->normal );
+	e->maskHash = s_ldcMaskHash;
+	e->gen = s_ldcGen;
+	if ( e->ret ) {
+		VectorCopy( lightDir, e->dir );
+	}
+	return e->ret;
 }
 
 /*

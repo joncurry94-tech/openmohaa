@@ -4661,6 +4661,8 @@ void R_HzmPerfFrame(void);
 uint64_t R_HzmMicros(void);
 extern qboolean hzmTiming;			// someone is listening: take the timestamps
 extern uint64_t hzmFrontUs, hzmBackUs;
+// HZM gl2 [render-perf 4] the R_LightDirForPoint memo (tr_light.c)
+void R_LightDirCacheFlush(void);
 extern hzmDrawBuffers_t          qglDrawBuffers;            // GL 2.0; NULL = no MRT colour resolve (blit fallback)
 extern hzmBindFragDataLocation_t qglBindFragDataLocation;   // GL 3.0; NULL = no MRT colour resolve (blit fallback)
 qboolean    R_MsaaResolvesActive(void);
